@@ -31,7 +31,7 @@
 
 #include "x8h7.h"
 
-/* Phase 7.1.6.1 (Option c): gate TRACE-1a/2/3 in start_xmit (default 0 = off). TRACE-1 stays unconditional - bridge-decompose harness consumes it as T1 event source. */
+/* Phase 7.1.6.1 (Option c) / Patch 0082: every TX/RX TRACE pr_info is gated behind this (default 0 = off; ~36 ms/call on the LmP console). */
 #define DEBUG_X8H7_TX_TRACE 0
 
 #define DRIVER_NAME "x8h7_can"
@@ -96,6 +96,7 @@ static const struct can_bittiming_const x8h7_can_data_bittiming_const = {
 
 static void x8h7_can_tx_work_handler(struct work_struct *ws);
 static int x8h7_can_hw_setup(struct x8h7_can_priv *priv);
+static int x8h7_can_hw_stop(struct x8h7_can_priv *priv);
 static void x8h7_can_error_skb(struct net_device *net, int can_id, int data1);
 
 /**
@@ -141,131 +142,192 @@ static char* can_sts(enum can_state sts)
   }
 }
 
-/**
- */
-/* Phase 7.4.42.1 Patch 0090 (T4) -- signature widened to accept full packet so
- * T4 can read pkt->data[2]=TEC and pkt->data[3]=REC guarded by pkt->size >= 4.
- * Backward compatible: 2-byte status frames (size==2) skip the length-guarded
- * block; behavior for intf/eflag is unchanged. */
+/* Phase 07.4.42.2 P0-4 — retire @count oldest in-flight frames.
+ * ok=true: deliver the echo (tx_packets/tx_bytes); ok=false: drop the echo
+ * (tx_dropped). Clamped to the in-flight count, so an over-reporting H7 can
+ * never retire a frame that was not sent. Called from the x8h7 threaded IRQ
+ * (spidev->lock held) — never touches SPI. can_get_echo_skb() -> netif_rx()
+ * runs with BH disabled, which is valid (NET_RX runs at spin_unlock_bh). */
+static void x8h7_can_tx_retire(struct x8h7_can_priv *priv, u32 count, bool ok)
+{
+  struct net_device *net = priv->net;
+  u32 inflight, i;
+
+  if (!count)
+    return;
+
+  spin_lock_bh(&priv->ring_lock);
+  inflight = priv->tx_head - priv->tx_inflight;
+  if (count > inflight)
+    count = inflight;
+  for (i = 0; i < count; i++) {
+    unsigned int idx = priv->tx_inflight & X8H7_CAN_TX_RING_MASK;
+
+    if (ok) {
+      net->stats.tx_bytes += can_get_echo_skb(net, idx, NULL);
+      net->stats.tx_packets++;
+    } else {
+      can_free_echo_skb(net, idx, NULL);
+      net->stats.tx_dropped++;
+    }
+    priv->tx_inflight++;
+  }
+  if (count && netif_queue_stopped(net) &&
+      (priv->tx_tail - priv->tx_inflight) < X8H7_CAN_TX_RING_SIZE)
+    netif_wake_queue(net);
+  spin_unlock_bh(&priv->ring_lock);
+}
+
+/* Phase 07.4.42.2 P0-4 — drop every queued/in-flight frame and resynchronise
+ * the ring (ndo_tx_timeout, CAN_MODE_START, ndo_stop). Bumping tx_gen tells a
+ * concurrently running work handler not to un-claim or re-queue the frames it
+ * snapshotted before the reset. All echo slots are freed (self-healing even if
+ * an echo leaked outside [tx_inflight, tx_tail)); tx_dropped counts only slots
+ * that still held an echo — close_candev()/can_restart() have already flushed
+ * and counted theirs via can_flush_echo_skb(). */
+static void x8h7_can_tx_ring_reset(struct x8h7_can_priv *priv, bool wake)
+{
+  struct net_device *net = priv->net;
+  u32 dropped = 0;
+  unsigned int idx;
+
+  spin_lock_bh(&priv->ring_lock);
+  for (idx = 0; idx < X8H7_CAN_TX_RING_SIZE; idx++) {
+    if (priv->can.echo_skb[idx]) {
+      can_free_echo_skb(net, idx, NULL);
+      dropped++;
+    }
+  }
+  net->stats.tx_dropped += dropped;
+  priv->tx_head     = priv->tx_tail;
+  priv->tx_inflight = priv->tx_tail;
+  priv->tx_gen++;
+  spin_unlock_bh(&priv->ring_lock);
+  hrtimer_try_to_cancel(&priv->batch_timer);
+  if (wake)
+    netif_wake_queue(net);
+}
+
+/* Phase 07.4.42.2 P1-4 — error state from the H7 4-byte report
+ * {INT_ERR, flags, TEC, REC} (new H7 fdcan_report_error_state(): PSR BusOff ->
+ * TX_BO, ErrorPassive -> TX_EP|RX_EP, Warning -> EWARN, none -> 0x00).
+ * Replaces Patch 0090's mapping of a per-frame TX submit failure (TX_EP) to
+ * ERROR_PASSIVE and its shared can_id/data1 accumulator (IN-09). Leaving
+ * BUS_OFF is reserved to the restart path (can_restart() ->
+ * CAN_MODE_START -> x8h7_can_restart_work_fn), so a late non-bus-off report
+ * cannot leave the kernel at ERROR_ACTIVE with the carrier still off.
+ * Threaded IRQ context: no SPI, no printk. */
+static void x8h7_can_error_state(struct x8h7_can_priv *priv, u8 flags, u8 tec, u8 rec)
+{
+  struct net_device *net = priv->net;
+  enum can_state     new_state, tx_state, rx_state;
+  struct can_frame  *cf = NULL;
+  struct sk_buff    *skb;
+
+  priv->last_tec = tec;
+  priv->last_rec = rec;
+
+  if (flags & X8H7_CAN_STS_FLG_TX_BO)
+    new_state = CAN_STATE_BUS_OFF;
+  else if (flags & (X8H7_CAN_STS_FLG_TX_EP | X8H7_CAN_STS_FLG_RX_EP))
+    new_state = CAN_STATE_ERROR_PASSIVE;
+  else if (flags & X8H7_CAN_STS_FLG_EWARN)
+    new_state = CAN_STATE_ERROR_WARNING;
+  else
+    new_state = CAN_STATE_ERROR_ACTIVE;
+
+  if (new_state == priv->can.state)
+    return;   /* can_change_state() would warn "state did not change" */
+  if (priv->can.state == CAN_STATE_BUS_OFF)
+    return;   /* only the restart path leaves bus-off */
+
+  tx_state = (tec >= rec) ? new_state : CAN_STATE_ERROR_ACTIVE;
+  rx_state = (rec >= tec) ? new_state : CAN_STATE_ERROR_ACTIVE;
+
+  skb = alloc_can_err_skb(net, &cf);
+  can_change_state(net, skb ? cf : NULL, tx_state, rx_state);
+  if (skb) {
+    cf->can_id |= CAN_ERR_CNT;
+    cf->data[6] = tec;
+    cf->data[7] = rec;
+    netif_rx(skb);
+  }
+  if (new_state == CAN_STATE_BUS_OFF)
+    can_bus_off(net);   /* carrier off + restart_ms timer; no SPI */
+}
+
+/* Phase 07.4.42.2 — CAN_STATUS (opcode 0x40, H7 -> kernel) per the shared
+ * WIRE CONTRACT (07.4.42.2-04-PLAN <interfaces>; the same table is in the H7
+ * Plans 05/06). Accepts both the new H7 firmware and the legacy one (md5
+ * ebbd8d8e):
+ *   {TX_COMPLETE, n_finished, n_aborted}  3 B new    retire n_finished:
+ *                                                    (n - aborted) ok, aborted dropped
+ *   {TX_COMPLETE, mask}                   2 B legacy retire hweight8(mask) ok
+ *   {TX_ABORT_COMPLETE, mask}             2 B legacy retire hweight8(mask) dropped
+ *   {INT_ERR, TX_OVR[, 0]}              2|3 B        tx_fifo_errors + error skb;
+ *                                                    retire 1 dropped only if 2 B
+ *   {INT_ERR, TX_EP[, 0]}               2|3 B        tx_errors (submit failure, not a
+ *                                                    state change); retire 1 dropped only if 2 B
+ *   {INT_ERR, RX_OVR, n_lost}             3 B new    rx_over_errors += max(n_lost, 1)
+ *   {INT_ERR, flags, TEC, REC}            4 B new    error-state report
+ *   {TX_FIFO_EMPTY, free}                 2 B        ignored
+ * Inside INT_ERR, size >= 4 is an error-state report, < 4 per-event flags.
+ * Runs in the x8h7 threaded IRQ with spidev->lock held: must never call
+ * x8h7_pkt_send_*. No printk here (Pitfall 6, ~36 ms/call on the console). */
 static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
 {
-  u8 intf  = pkt->data[0];
-  u8 eflag = pkt->data[1];
-  struct net_device  *net = priv->net;
-  int                 can_id = 0;
-  int                 data1 = 0;
-  bool                need_busoff = false;
+  struct net_device *net   = priv->net;
+  u8                 intf  = pkt->data[0];
+  u8                 eflag = pkt->data[1];
 
-  //DBG_PRINT("\n");
-
-  if (intf & X8H7_CAN_STS_INT_ERR)
-  {
-    /* Handle overflow counters */
-    if (eflag & X8H7_CAN_STS_FLG_RX_OVR)
-    {
-      net->stats.rx_over_errors++;
-      net->stats.rx_errors++;
-      can_id |= CAN_ERR_CRTL;
-      data1 |= CAN_ERR_CRTL_RX_OVERFLOW;
-      x8h7_can_error_skb(net, can_id, data1);
-    }
-    if (eflag & X8H7_CAN_STS_FLG_TX_OVR)
-    {
-      net->stats.tx_fifo_errors++;
-      net->stats.tx_errors++;
-      can_id |= CAN_ERR_CRTL;
-      data1 |= CAN_ERR_CRTL_TX_OVERFLOW;
-      x8h7_can_error_skb(net, can_id, data1);
-    }
-    /* Phase 7.4.42.1 Patch 0090 (T3) -- handle FDCAN2 bus-off.
-     * H7 HAL_FDCAN_ErrorStatusCallback (Patch 0091) emits {INT_ERR, TX_BO[, TEC, REC]}
-     * when the FDCAN bus-off state is entered. We transition the kernel
-     * can1 interface to BUS_OFF and call can_bus_off() which arms the
-     * restart_ms timer (restart_ms 100 set by Plan 01 T1).
-     * can_bus_off() bumps can_stats.bus_off and schedules can_do_set_mode
-     * (CAN_MODE_START) after restart_ms -- which calls x8h7_can_do_set_mode
-     * -> x8h7_can_restart -> (via restart_work) x8h7_can_hw_setup.
-     * No new pr_info here (Pitfall 6, ~36 ms/call cost at LmP console). */
-    if (eflag & X8H7_CAN_STS_FLG_TX_BO) {
-      net->stats.rx_errors++;
-      can_id |= CAN_ERR_BUSOFF;
-      x8h7_can_error_skb(net, can_id, data1);
-      priv->can.state = CAN_STATE_BUS_OFF;
-      need_busoff = true;
-    }
-    /* Phase 7.4.42.1 Patch 0090 (T4) -- cache TEC/REC from extended 4-byte payload.
-     * ASVS V5 length-guard: only read data[2]/data[3] when pkt->size >= 4.
-     * Backward compatible: a 2-byte status (T3 only, size==2) skips this block.
-     * No pr_info (Pitfall 6). */
+  if (intf & X8H7_CAN_STS_INT_ERR) {
     if (pkt->size >= 4) {
-      priv->last_tec = pkt->data[2];
-      priv->last_rec = pkt->data[3];
+      x8h7_can_error_state(priv, eflag, pkt->data[2], pkt->data[3]);
+    } else {
+      if (eflag & X8H7_CAN_STS_FLG_RX_OVR) {
+        u32 lost = (pkt->size >= 3 && pkt->data[2]) ? pkt->data[2] : 1;
+
+        net->stats.rx_over_errors += lost;
+        net->stats.rx_errors      += lost;
+        x8h7_can_error_skb(net, CAN_ERR_CRTL, CAN_ERR_CRTL_RX_OVERFLOW);
+      }
+      if (eflag & X8H7_CAN_STS_FLG_TX_OVR) {
+        /* H7 Tx FIFO full, frame rejected. The new H7 also counts the
+         * reject in its next TX_COMPLETE (3 B form) — retire only for 2 B. */
+        net->stats.tx_fifo_errors++;
+        net->stats.tx_errors++;
+        x8h7_can_error_skb(net, CAN_ERR_CRTL, CAN_ERR_CRTL_TX_OVERFLOW);
+        if (pkt->size < 3)
+          x8h7_can_tx_retire(priv, 1, false);
+      }
+      if (eflag & X8H7_CAN_STS_FLG_TX_EP) {
+        /* per-frame submit failure, NOT error-passive — RESEARCH P1-4 */
+        net->stats.tx_errors++;
+        if (pkt->size < 3)
+          x8h7_can_tx_retire(priv, 1, false);
+      }
     }
-    /* Phase 7.4.42.1 Patch 0090 (T3) -- WR-01: error-passive / error-warning state
-     * changes. These blocks are kept INSIDE the INT_ERR guard so they only run when
-     * the H7 actually flagged an error interrupt. A TX_COMPLETE-only status frame
-     * carries pkt->data[1] (eflag) from a different code path and must NOT drive
-     * the kernel CAN state machine. (REVIEW WR-01 fix.) */
-    if (eflag & X8H7_CAN_STS_FLG_TX_EP) {
-      priv->can.state = CAN_STATE_ERROR_PASSIVE;
-    }
-    if (eflag & X8H7_CAN_STS_FLG_EWARN) {
-      /* Stay ERROR_WARNING unless already at ERROR_PASSIVE or BUS_OFF. */
-      if (priv->can.state == CAN_STATE_ERROR_ACTIVE)
-        priv->can.state = CAN_STATE_ERROR_WARNING;
-    }
-    /* Call can_bus_off() outside the INT_ERR block's inner logic but still inside
-     * the INT_ERR guard. need_busoff is only ever set inside this block, so
-     * evaluating it here is functionally identical to evaluating it after.
-     * can_bus_off() does no SPI -- it only arms the restart timer -- so it is
-     * safe to call here. (REVIEW WR-01 rationale: can_bus_off outside SPI context.) */
-    if (need_busoff)
-      can_bus_off(net);
   }
 
   if (intf & X8H7_CAN_STS_INT_TX_COMPLETE) {
-    /* Phase 7.4.42 Patch 0089 — TX batching demux.
-     * H7's HAL_FDCAN_TxBufferCompleteCallback emits one x8_msg per IRQ but
-     * BufferIndexes (carried as a bitmask in the second byte of x8_msg by
-     * stm32h7-fw/src/can_handler.c:542) may indicate multiple TX buffers
-     * completed simultaneously. The simplest correct approach: free ALL
-     * outstanding echo skbs on any TX_COMPLETE. By the time any frame in
-     * a batch completes, all batched frames have been TX'd by H7 (they
-     * share the same SPI exchange and H7 dispatches them sequentially to
-     * FDCAN TX buffers). Subsequent TX_COMPLETE IRQs for the same batch
-     * find batch_outstanding==0 and become no-ops. */
-    int batch_count;
-    unsigned long flags;
-    int i;
+    if (pkt->size >= 3) {
+      u32 done    = pkt->data[1];
+      u32 aborted = min_t(u32, pkt->data[2], done);
 
-    spin_lock_irqsave(&priv->ring_lock, flags);
-    batch_count = atomic_read(&priv->batch_outstanding);
-    atomic_set(&priv->batch_outstanding, 0);
-    spin_unlock_irqrestore(&priv->ring_lock, flags);
-
-    DBG_PRINT("TX COMPLETE (batch=%d)", batch_count);
-
-    /* Free echo skbs for all idx in 0..batch_count-1. can_get_echo_skb
-     * tolerates being called on already-empty slots (returns NULL); the
-     * count is the upper bound on what could be queued. */
-    for (i = 0; i < batch_count; i++) {
-      can_get_echo_skb(net, i, NULL);
+      x8h7_can_tx_retire(priv, done - aborted, true);
+      x8h7_can_tx_retire(priv, aborted, false);
+    } else {
+      /* legacy sticky TXBTO mask; over-reports are clamped in retire */
+      x8h7_can_tx_retire(priv, hweight8(pkt->data[1]), true);
     }
-
-    net->stats.tx_packets += (batch_count > 0) ? batch_count : 1;
-    net->stats.tx_bytes += priv->tx_len;
-    priv->tx_len = 0;
-
-    netif_wake_queue(net);
   }
 
-  if (intf & X8H7_CAN_STS_INT_TX_ABORT_COMPLETE)
-  {
+  if (intf & X8H7_CAN_STS_INT_TX_ABORT_COMPLETE) {
     DBG_PRINT("TX ABORT COMPLETE");
+    x8h7_can_tx_retire(priv, hweight8(pkt->data[1]), false);
   }
 
-  if (intf & X8H7_CAN_STS_INT_TX_FIFO_EMPTY)
-  {
+  if (intf & X8H7_CAN_STS_INT_TX_FIFO_EMPTY) {
     DBG_PRINT("TX FIFO EMPTY");
   }
 }
@@ -295,6 +357,19 @@ static void x8h7_can_hook(void *arg, x8h7_pkt_t *pkt)
 
       /* Copy the full header (6 bytes) first to read the flags byte. */
       memcpy(x8h7_can_msg.buf, pkt->data, X8H7_CAN_HEADER_SIZE);
+
+      /* Phase 07.4.42.2 P1-9 — field.len comes from the wire: drop (and
+       * count) a subpacket that is shorter than its header claims or longer
+       * than a CAN-FD frame, and an FD-length frame on a classic-mode
+       * interface (it would overrun the 8-byte can_frame below). */
+      if (x8h7_can_msg.field.len > X8H7_CAN_FRAME_MAX_DATA_LEN ||
+          pkt->size < X8H7_CAN_HEADER_SIZE + x8h7_can_msg.field.len ||
+          (x8h7_can_msg.field.len > CAN_MAX_DLEN &&
+           !(priv->can.ctrlmode & CAN_CTRLMODE_FD))) {
+        priv->net->stats.rx_length_errors++;
+        priv->net->stats.rx_errors++;
+        return;
+      }
       is_fd = (x8h7_can_msg.field.flags & X8H7_CAN_FLAG_FD) != 0;
 
       /* Phase 7.4.37 A1: local_bh_disable around alloc + dispatch for
@@ -447,33 +522,45 @@ static void x8h7_can_diag_exit(void) {
 #endif
 
 /*
- * device (auto-)restart mechanism runs in a timer context =>
- * MUST handle restart with asynchronous spi transfers (if any)
+ * Bus-off restart. Kernel 6.1 drivers/net/can/dev/dev.c can_restart() runs from
+ * the can_priv restart delayed work (restart_ms) or the IFLA_CAN_RESTART netlink
+ * request — process context in both cases — and calls do_set_mode(CAN_MODE_START)
+ * after can_flush_echo_skb() and the CAN_ERR_RESTARTED error frame. The H7
+ * re-init itself still runs on priv->wq (Patch 0090 structure).
  */
 
-/* Phase 7.4.42.1 Patch 0090 (T3) -- restart_work handler.
- * Runs in priv->wq workqueue context (WQ_HIGHPRI, off timer/softirq).
- * x8h7_can_hw_setup() calls x8h7_pkt_send_sync() which takes the spidev
- * mutex and may sleep -- safe here since we are NOT in timer/atomic context.
- * After re-init, set CAN_STATE_ERROR_ACTIVE + wake netif queue (these were
- * already in x8h7_can_restart but ran without the H7 having been re-inited). */
+/* Phase 7.4.42.1 Patch 0090 (T3) / 07.4.42.2 P1-4 — restart_work handler.
+ * Runs in priv->wq workqueue context (WQ_HIGHPRI). x8h7_can_hw_stop/_setup
+ * call x8h7_pkt_send_sync(), which takes the spidev mutex and may sleep —
+ * safe here. The TX queue was stopped by x8h7_can_restart() and is woken only
+ * once the H7 has been re-initialised. */
 static void x8h7_can_restart_work_fn(struct work_struct *ws)
 {
   struct x8h7_can_priv *priv = container_of(ws, struct x8h7_can_priv, restart_work);
   struct net_device    *net  = priv->net;
+  int                   ret;
 
-  DBG_PRINT("bus-off restart: re-init FDCAN2 via x8h7_can_hw_setup\n");
-  x8h7_can_hw_setup(priv);
+  DBG_PRINT("bus-off restart: re-init FDCAN via x8h7_can_hw_stop + x8h7_can_hw_setup\n");
+  x8h7_can_hw_stop(priv);
+  ret = x8h7_can_hw_setup(priv);
+  if (ret) {
+    netdev_err(net, "bus-off restart: H7 re-init failed (%d); TX queue left stopped\n", ret);
+    return;
+  }
 
-  /* Phase 7.4.42.1 Patch 0090 (T4 / WR-02) -- announce recovery to userspace.
-   * Emit a CAN_ERR_RESTARTED error frame so SocketCAN observers (CAN_RAW_ERR_FILTER
-   * already enables CAN_ERR_RESTARTED) see the bus-off->active recovery, activating
-   * the is_restarted WARN branch in diag_can_bus_health (ophanim_system.cpp). */
-  x8h7_can_error_skb(net, CAN_ERR_RESTARTED, 0);
+  /* No CAN_ERR_RESTARTED skb here: drivers/net/can/dev/dev.c can_restart()
+   * already emitted it before calling do_set_mode(CAN_MODE_START). Patch 0090's
+   * second emission (REVIEW WR-02) was a duplicate — RESEARCH P1-4. */
   /* Reset cached TEC/REC so `ip -d link show can1` berr-counter does not report
-   * stale near-bus-off counters after a healthy restart (addresses REVIEW IN-03). */
+   * stale near-bus-off counters after a healthy restart (REVIEW IN-03). */
   priv->last_tec = 0;
   priv->last_rec = 0;
+
+  /* Frames that slipped in between the CAN_MODE_START ring reset and the
+   * queue stop in x8h7_can_restart() (linkwatch may keep the qdisc active for
+   * up to ~1 s after carrier-off) went to an H7 that was just re-initialised:
+   * drop them so the ring is exactly empty when the queue is woken. */
+  x8h7_can_tx_ring_reset(priv, false);
 
   /* Transition back to ERROR_ACTIVE and wake the TX queue. */
   priv->can.state = CAN_STATE_ERROR_ACTIVE;
@@ -487,14 +574,16 @@ static int x8h7_can_restart(struct net_device *net)
 
   DBG_PRINT("\n");
 
-  /* Phase 7.4.42.1 Patch 0090 (T3) -- context-safe H7 re-init.
-   * x8h7_can_restart runs in timer context (can_dev restart timer, see
-   * comment at :394-397 above). We MUST NOT call x8h7_pkt_send_sync here
-   * as it takes the spidev mutex and may sleep (timer context = atomic).
-   * Use queue_work to defer x8h7_can_hw_setup() off the timer context.
-   * Guard: if wq is NULL (x8h7_can_stop already ran) skip to avoid
-   * use-after-free -- the bus is already being torn down. */
+  /* Phase 7.4.42.1 Patch 0090 (T3) — defer the H7 re-init (x8h7_pkt_send_sync
+   * takes the spidev mutex) to priv->wq. Guard: if wq is NULL (x8h7_can_stop
+   * already ran) skip to avoid use-after-free — the bus is being torn down.
+   * Phase 07.4.42.2: keep start_xmit out until restart_work has re-initialised
+   * the H7 (the core turns the carrier back on as soon as we return), so no
+   * frame races the DEINIT/INIT pair. netif_trans_update() stops dev_watchdog
+   * from treating the stopped queue as a TX stall in the meantime. */
   if (priv->wq) {
+    netif_trans_update(net);
+    netif_stop_queue(net);
     queue_work(priv->wq, &priv->restart_work);
   } else {
     netdev_warn(net, "x8h7_can_restart: wq=NULL (stop in progress), skipping H7 re-init\n");
@@ -554,9 +643,8 @@ static int x8h7_can_hw_setup(struct x8h7_can_priv *priv)
             x8h7_msg.field.time_segment_2,
             x8h7_msg.field.sync_jump_width);
 
-  x8h7_pkt_send_sync(priv->periph, X8H7_CAN_OC_INIT, sizeof(x8h7_msg.buf), x8h7_msg.buf);
-
-  return 0;
+  /* 07.4.42.2 IN-08: propagate x8h7_pkt_send_sync() failure */
+  return x8h7_pkt_send_sync(priv->periph, X8H7_CAN_OC_INIT, sizeof(x8h7_msg.buf), x8h7_msg.buf) < 0 ? -EIO : 0;
 }
 
 /**
@@ -576,9 +664,8 @@ static int x8h7_can_hw_do_set_data_bittiming(struct net_device *net)
  */
 static int x8h7_can_hw_stop(struct x8h7_can_priv *priv)
 {
-  x8h7_pkt_send_sync(priv->periph, X8H7_CAN_OC_DEINIT, 0, NULL);
-
-  return 0;
+  /* 07.4.42.2 IN-08: propagate x8h7_pkt_send_sync() failure */
+  return x8h7_pkt_send_sync(priv->periph, X8H7_CAN_OC_DEINIT, 0, NULL) < 0 ? -EIO : 0;
 }
 
 /**
@@ -618,7 +705,7 @@ static void x8h7_can_error_skb(struct net_device *net, int can_id, int data1)
  */
 /* Phase 7.4.42 Patch 0089 — hrtimer callback for partial-batch flush.
  * Forward declared so x8h7_can_open below can register it. The callback
- * runs in softirq context; safe to call queue_work (which is irq-safe).
+ * runs in hard-IRQ context; it only calls queue_work (which is irq-safe).
  * Definition placed AFTER x8h7_can_tx_work_handler so we can reference
  * priv->work and the workqueue directly. */
 static enum hrtimer_restart x8h7_can_batch_timer_cb(struct hrtimer *t);
@@ -636,15 +723,15 @@ static int x8h7_can_open(struct net_device *net)
     return ret;
   }
 
-  priv->tx_len  = 0;
-
-  /* Phase 7.4.42 Patch 0089 — initialize TX batching state.
-   * spinlock used (not mutex) because start_xmit may run in softirq context
-   * and the lock-holders are short (only update batch_outstanding + tx_ring;
-   * NEVER hold while calling x8h7_pkt_send_defer/now which take the spidev
-   * mutex and may sleep). */
+  /* Phase 7.4.42 Patch 0089 / 07.4.42.2 P0-4 — initialize TX ring state.
+   * spinlock (not mutex): start_xmit runs with BH disabled and lock holders
+   * are short (ring indices + tx_ring copies; NEVER held while calling
+   * x8h7_pkt_send_defer/now which take the spidev mutex and may sleep).
+   * Echo slots are empty here (close_candev() flushed them at the last stop),
+   * so the counters restart at 0. */
   spin_lock_init(&priv->ring_lock);
-  atomic_set(&priv->batch_outstanding, 0);
+  priv->tx_tail = priv->tx_head = priv->tx_inflight = 0;
+  priv->tx_gen = 0;
   hrtimer_init(&priv->batch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
   priv->batch_timer.function = x8h7_can_batch_timer_cb;
 
@@ -694,7 +781,11 @@ static int x8h7_can_stop(struct net_device *net)
 
   /* Notify upper level */
   netif_stop_queue(net);
-  close_candev(net);
+  close_candev(net);   /* cancels the core restart work + flushes echo skbs */
+
+  /* 07.4.42.2: a bus-off restart_work still queued must not re-init the H7
+   * (and wake the queue) after the DEINIT below. */
+  cancel_work_sync(&priv->restart_work);
 
   /* Notify ext. hw to stop can peripheral */
   x8h7_can_hw_stop(priv);
@@ -702,6 +793,8 @@ static int x8h7_can_stop(struct net_device *net)
   /* Phase 7.4.42 Patch 0089 — cancel batch flush timer BEFORE destroying
    * workqueue. hrtimer_cancel() is safe to call even if timer never fired. */
   hrtimer_cancel(&priv->batch_timer);
+  /* 07.4.42.2 P0-4 — drop anything still queued so a later open starts clean. */
+  x8h7_can_tx_ring_reset(priv, false);
 
   /* Free priv. resources */
   mutex_lock(&priv->lock);
@@ -721,84 +814,61 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
                                        struct net_device *net)
 {
   struct x8h7_can_priv        *priv = netdev_priv(net);
-  const struct device         *dev = priv->dev;
-  struct canfd_frame          *cfd_dbg;
   struct canfd_frame          *cfd;
   bool                         is_fd;
-  int                          slot;
-  unsigned long                flags;
-  bool                         queue_was_full;
+  unsigned int                 slot;
+  u32                          pending;
 
   DBG_PRINT("\n");
 
-  cfd_dbg = (struct canfd_frame *)skb->data;
 #if DEBUG_X8H7_TX_TRACE
-  pr_info("[x8h7_can_TRACE-1] start_xmit: dev=%s skb_len=%u id=0x%08X len=%u state=%d qstop=%d outstanding=%d\n",
-          net->name, skb->len, cfd_dbg->can_id, cfd_dbg->len,
-          priv->can.state, netif_queue_stopped(net),
-          atomic_read(&priv->batch_outstanding));
+  pr_info("[x8h7_can_TRACE-1] start_xmit: dev=%s skb_len=%u state=%d qstop=%d tail=%u head=%u inflight=%u\n",
+          net->name, skb->len, priv->can.state, netif_queue_stopped(net),
+          priv->tx_tail, priv->tx_head, priv->tx_inflight);
 #endif
 
-  if (can_dropped_invalid_skb(net, skb)) {
-#if DEBUG_X8H7_TX_TRACE
-    pr_info("[x8h7_can_TRACE-1a] start_xmit: skb DROPPED by can_dropped_invalid_skb\n");
-#endif
+  if (can_dropped_invalid_skb(net, skb))
     return NETDEV_TX_OK;
-  }
 
   is_fd = can_is_canfd_skb(skb);
   cfd   = (struct canfd_frame *)skb->data;
 
-  /* Phase 7.4.42 Patch 0089 — TX batching ring populate.
-   * Acquire ring_lock; reserve a slot in tx_ring; populate the frame; queue
-   * the echo skb at the reserved idx; release lock. We do NOT call
-   * x8h7_pkt_send_defer here — that happens in the work handler with all
-   * batched frames at once. */
-  spin_lock_irqsave(&priv->ring_lock, flags);
-
-  slot = atomic_read(&priv->batch_outstanding);
-  if (slot >= X8H7_CAN_BATCH_MAX) {
-    /* Ring full — kernel should never reach here because we stop the queue
-     * on the previous frame when we hit MAX, but defensive guard remains. */
-    spin_unlock_irqrestore(&priv->ring_lock, flags);
+  /* Phase 07.4.42.2 P0-4 — append at tx_tail. The echo skb is put under
+   * ring_lock BEFORE the slot is published (tx_tail++), so a TX_COMPLETE can
+   * never retire a slot whose echo is not there yet, and a slot is reused only
+   * after it was retired (no "echo_skb is occupied"). The work handler sends
+   * [tx_head, tx_tail); the status handler retires from tx_inflight. */
+  spin_lock_bh(&priv->ring_lock);
+  if (priv->tx_tail - priv->tx_inflight >= X8H7_CAN_TX_RING_SIZE) {
+    /* Ring full — normally unreachable (we stop the queue when the last slot
+     * is taken below). */
     netif_stop_queue(net);
-#if DEBUG_X8H7_TX_TRACE
-    pr_info("[x8h7_can_TRACE-1b] start_xmit: ring FULL (slot=%d) — returning NETDEV_TX_BUSY\n", slot);
-#endif
+    spin_unlock_bh(&priv->ring_lock);
     return NETDEV_TX_BUSY;
   }
-
+  slot = priv->tx_tail & X8H7_CAN_TX_RING_MASK;
   x8h7_can_frame_to_tx_obj(cfd, &priv->tx_ring[slot], is_fd);
-  atomic_inc(&priv->batch_outstanding);
-  queue_was_full = (slot + 1) >= X8H7_CAN_BATCH_MAX;
+  if (can_put_echo_skb(skb, net, slot, 0)) {
+    /* -ENOMEM / -EBUSY: the skb was freed by can_put_echo_skb() */
+    net->stats.tx_dropped++;
+    spin_unlock_bh(&priv->ring_lock);
+    return NETDEV_TX_OK;   /* skb consumed in all cases */
+  }
+  priv->tx_tail++;
+  pending = priv->tx_tail - priv->tx_head;
+  if (priv->tx_tail - priv->tx_inflight >= X8H7_CAN_TX_RING_SIZE)
+    netif_stop_queue(net);   /* woken by x8h7_can_tx_retire / ring reset */
+  spin_unlock_bh(&priv->ring_lock);
 
-  spin_unlock_irqrestore(&priv->ring_lock, flags);
-
-#if DEBUG_X8H7_TX_TRACE
-  pr_info("[x8h7_can_TRACE-2] start_xmit: pre can_put_echo_skb (idx=%d, is_fd=%d, len=%u)\n",
-          slot, is_fd, cfd->len);
-#endif
-  /* Echo skb uses the SAME slot index — alloc_candev was bumped to
-   * X8H7_CAN_BATCH_MAX so idx 0..MAX-1 are valid. The IRQ-side TX_COMPLETE
-   * handler frees all outstanding echoes (simpler than per-H7-buf-idx
-   * demux; tradeoff is wasted accounting but no leak). */
-  can_put_echo_skb(skb, net, slot, 0);
-
-  if (queue_was_full) {
-    /* Stop the netif queue BEFORE scheduling work — prevents another
-     * start_xmit from racing with the work handler's flush. Wake happens
-     * in the TX_COMPLETE handler after batch drains. */
-    netif_stop_queue(net);
-#if DEBUG_X8H7_TX_TRACE
-    pr_info("[x8h7_can_TRACE-3] start_xmit: batch FULL -> stop_queue + queue_work (wq=%p)\n",
-            priv->wq);
-#endif
-    /* Cancel any pending hrtimer; the immediate queue_work supersedes it. */
+  if (pending >= X8H7_CAN_BATCH_MAX) {
+    /* Full batch — flush now; the immediate queue_work supersedes the timer. */
     hrtimer_try_to_cancel(&priv->batch_timer);
     queue_work(priv->wq, &priv->work);
-  } else if (!hrtimer_active(&priv->batch_timer)) {
-    /* First frame of a new batch — arm the deadline timer to ensure
-     * partial batches flush even at low TX rate. */
+  } else if (!hrtimer_is_queued(&priv->batch_timer)) {
+    /* Partial batch — arm the deadline timer so it flushes even at low TX
+     * rate. hrtimer_is_queued (not hrtimer_active): re-arming while the
+     * callback is running is legal and closes the window in which the
+     * callback's queue_work already ran before this frame was published. */
     hrtimer_start(&priv->batch_timer,
                   ns_to_ktime(X8H7_CAN_BATCH_DEADLINE_NS),
                   HRTIMER_MODE_REL);
@@ -813,8 +883,8 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
  * Decouple the TX work handler's enqueue phase from the SPI-exchange phase so
  * the singleton `spidev->lock` (also taken by `x8h7_threaded_isr` at
  * `x8h7_drv.c:451`) is held for the SHORT enqueue window (~microseconds), then
- * released; the subsequent `x8h7_pkt_send_now()` re-takes it for the ~40 ms
- * SPI exchange.
+ * released; the subsequent `x8h7_pkt_send_now()` re-takes it for the SPI
+ * exchange (~0.3 ms measured p50 per SPI exchange (Phase 7.4.41)).
  *
  * Why this matters: previously, `x8h7_pkt_send_sync` held the mutex for the
  * ENTIRE 40 ms TX exchange. A concurrent threaded ISR (carrying a motor 0xA0
@@ -833,7 +903,7 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
  * exported in the production kernel module; no new exports required.
  *
  * Known limitation (carry-forward): the explicit `x8h7_pkt_send_now()` still
- * acquires the full mutex for the 40 ms SPI exchange. The TX vs RX SPI
+ * acquires the full mutex for the whole SPI exchange. The TX vs RX SPI
  * exchanges remain structurally serialized; full collapse to one full-duplex
  * exchange would require relying on the next IRQ-driven exchange to flush
  * pending TX (deadlock risk if no IRQ arrives — out of scope for Plan 02).
@@ -841,100 +911,70 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
 static void x8h7_can_tx_work_handler(struct work_struct *ws)
 {
   struct x8h7_can_priv *priv = container_of(ws, struct x8h7_can_priv, work);
-  int spi_ret = 0;
-  int count;
-  int i;
-  unsigned long flags;
-  /* Snapshot the ring under the lock; release before calling x8h7_pkt_send_*
-   * which take the spidev mutex and may sleep (cannot hold spinlock while
-   * sleeping in atomic context).
-   *
-   * Phase 7.4.42 Patch 0089: extends the Phase 7.4.29 Fix-B mutex split to
-   * batch N frames per SPI exchange. The defer/now primitives from x8h7_drv
-   * accumulate sub-packets in spidev->x8h7_txb; calling defer N times before
-   * send_now coalesces N CAN frames into one ~40ms SPI exchange. Theoretical
-   * gain at N=6: ~6x reduction in SPI exchange count vs the single-frame
-   * Fix-B baseline. */
-  union x8h7_can_frame_message snap_ring[X8H7_CAN_BATCH_MAX];
+  /* Phase 7.4.42 Patch 0089 / 07.4.42.2 P0-4: up to X8H7_CAN_BATCH_MAX frames
+   * are deferred into spidev->x8h7_txb and flushed by ONE x8h7_pkt_send_now().
+   * The snapshot is taken under ring_lock, which is released before any
+   * x8h7_pkt_send_* call (spidev mutex; may sleep). */
+  union x8h7_can_frame_message snap[X8H7_CAN_BATCH_MAX];
+  u32  start, n, sent, gen, bytes;
+  bool more;
 
-  spin_lock_irqsave(&priv->ring_lock, flags);
-  count = atomic_read(&priv->batch_outstanding);
-  if (count > X8H7_CAN_BATCH_MAX)
-    count = X8H7_CAN_BATCH_MAX;  /* defensive cap */
-  for (i = 0; i < count; i++) {
-    snap_ring[i] = priv->tx_ring[i];
+  spin_lock_bh(&priv->ring_lock);
+  start = priv->tx_head;
+  for (n = 0, bytes = 0; n < X8H7_CAN_BATCH_MAX && start + n != priv->tx_tail; n++) {
+    union x8h7_can_frame_message const *f = &priv->tx_ring[(start + n) & X8H7_CAN_TX_RING_MASK];
+    u32 sz = X8H7_CAN_SUBPKT_HDR_SIZE + X8H7_CAN_HEADER_SIZE + f->field.len;
+
+    if (n && bytes + sz > X8H7_CAN_SPI_BUDGET)
+      break;   /* rest goes in the next exchange (re-queued below) */
+    bytes += sz;
+    snap[n] = *f;
   }
-  /* Note: we do NOT reset batch_outstanding here — TX_COMPLETE handler does
-   * that after freeing echo skbs, so the TX queue remains stopped until the
-   * H7 ACKs the batch. */
-  spin_unlock_irqrestore(&priv->ring_lock, flags);
+  priv->tx_head = start + n;   /* claim BEFORE deferring: the threaded IRQ may flush spidev->x8h7_txb and
+                                * an early TX_COMPLETE must be able to retire these frames */
+  gen = priv->tx_gen;
+  spin_unlock_bh(&priv->ring_lock);
 
-  if (count == 0) {
-    /* Spurious wakeup (e.g., timer fired after start_xmit already queued
-     * work that drained the ring) — no-op. */
-#if DEBUG_X8H7_TX_TRACE
-    pr_info("[x8h7_can_TRACE-4b] tx_work_handler: empty ring (spurious wakeup)\n");
-#endif
+  if (n == 0) {
+    /* Spurious wakeup (timer fired after a full-batch flush drained the ring,
+     * or the ring was reset) — no-op. */
     return;
   }
 
 #if DEBUG_X8H7_TX_TRACE
-  pr_info("[x8h7_can_TRACE-4] tx_work_handler: ENTRY periph=%u batch_count=%d\n",
-          priv->periph, count);
+  pr_info("[x8h7_can_TRACE-4] tx_work_handler: periph=%u start=%u n=%u bytes=%u\n",
+          priv->periph, start, n, bytes);
 #endif
 
-  /* Track total bytes for stats (sum across all frames in batch) — populated
-   * here before SPI exchange, reflects all frames being sent. TX_COMPLETE
-   * handler bumps tx_packets per IRQ; tx_bytes is set once per batch. */
-  priv->tx_len = 0;
-  for (i = 0; i < count; i++) {
-    priv->tx_len += snap_ring[i].field.len;
-  }
+  for (sent = 0; sent < n; sent++)
+    if (x8h7_pkt_send_defer(priv->periph, X8H7_CAN_OC_SEND,
+                            X8H7_CAN_HEADER_SIZE + snap[sent].field.len, snap[sent].buf) < 0)
+      break;   /* spidev txb full: un-claim the rest below, they go in the next exchange */
+
+  spin_lock_bh(&priv->ring_lock);
+  /* Un-claim the frames that were not deferred — unless the ring was reset
+   * meanwhile (tx_gen) or a status report already retired past them. */
+  if (sent < n && gen == priv->tx_gen && priv->tx_head == start + n &&
+      (s32)(priv->tx_inflight - (start + sent)) <= 0)
+    priv->tx_head = start + sent;
+  more = (gen == priv->tx_gen) && (priv->tx_tail != priv->tx_head);
+  spin_unlock_bh(&priv->ring_lock);
+
+  x8h7_pkt_send_now();   /* flushes our frames and anything else queued, frees txb for the remainder */
 
 #if DEBUG_X8H7_TX_TRACE
-  pr_info("[x8h7_can_TRACE-5] tx_work_handler: pre x8h7_pkt_send_defer (batch=%d, total_bytes=%d)\n",
-          count, priv->tx_len);
+  pr_info("[x8h7_can_TRACE-6] tx_work_handler: flushed sent=%u/%u more=%d\n", sent, n, more);
 #endif
 
-  /* Phase 7.4.42 Patch 0089 — defer all batched frames into the shared
-   * spidev->x8h7_txb. Each defer takes/releases the spidev mutex, so other
-   * peripherals or the threaded ISR can interleave between frames. If
-   * x8h7_pkt_enq returns -ENOMEM (buffer full), we break early and trigger
-   * a partial flush; remaining frames stay in the ring (kernel will issue
-   * NETDEV_TX_BUSY on the next start_xmit attempt and reschedule). */
-  for (i = 0; i < count; i++) {
-    int defer_ret = x8h7_pkt_send_defer(priv->periph,
-                       X8H7_CAN_OC_SEND,
-                       X8H7_CAN_HEADER_SIZE + snap_ring[i].field.len,
-                       snap_ring[i].buf);
-    if (defer_ret < 0) {
-      /* Buffer full in x8h7_drv. Flush what we've enqueued so far; the
-       * remaining frames in priv->tx_ring will be flushed by a subsequent
-       * work handler invocation triggered by either a new start_xmit hitting
-       * MAX, or the deadline timer. */
-#if DEBUG_X8H7_TX_TRACE
-      pr_info("[x8h7_can_TRACE-5b] tx_work_handler: defer returned %d at frame %d/%d — partial flush\n",
-              defer_ret, i, count);
-#endif
-      break;
-    }
-  }
-
-  /* Phase 2 — single SPI exchange flushes the entire batch. */
-  spi_ret = x8h7_pkt_send_now();
-
-#if DEBUG_X8H7_TX_TRACE
-  pr_info("[x8h7_can_TRACE-6] tx_work_handler: post x8h7_pkt_send_now ret=%d (sent %d frames)\n",
-          spi_ret, i);
-#endif
+  if (more && priv->wq)
+    queue_work(priv->wq, &priv->work);
 }
 
 /* Phase 7.4.42 Patch 0089 — hrtimer callback for partial-batch flush.
- * Runs in softirq context; safe to call queue_work (which is irq-safe).
- * The work handler will read priv->batch_outstanding under ring_lock and
- * drain the ring. If batch_outstanding==0 (race: start_xmit already filled
- * the batch and queued work that ran before us), the handler treats it as
- * a spurious wakeup and returns. */
+ * HRTIMER_MODE_REL timers expire in hard-IRQ context on this (non-RT) kernel:
+ * only queue_work() here (irq-safe), never ring_lock. The work handler reads
+ * [tx_head, tx_tail) under ring_lock; an empty range (a full-batch flush or a
+ * ring reset got there first) is a spurious wakeup and returns. */
 static enum hrtimer_restart x8h7_can_batch_timer_cb(struct hrtimer *t)
 {
   struct x8h7_can_priv *priv = container_of(t, struct x8h7_can_priv, batch_timer);
@@ -975,7 +1015,9 @@ static int x8h7_can_hw_do_set_bittiming(struct net_device *net)
 
 /*
  * candev callback used to change CAN mode.
- * Warning: this is called from a timer context!
+ * Kernel 6.1: called by can_restart() from the can_priv restart delayed work
+ * (restart_ms) or from the IFLA_CAN_RESTART netlink request — process context,
+ * not a timer.
  */
 static int x8h7_can_do_set_mode(struct net_device *net, enum can_mode mode)
 {
@@ -985,6 +1027,10 @@ static int x8h7_can_do_set_mode(struct net_device *net, enum can_mode mode)
 
   switch (mode) {
   case CAN_MODE_START:
+    /* 07.4.42.2 P0-4 scenario 5 — the core can_restart() already flushed the
+     * echo skbs; resynchronise the ring indices and drop every pre-bus-off
+     * command so nothing stale is replayed after the restart. */
+    x8h7_can_tx_ring_reset(netdev_priv(net), false);
     err = x8h7_can_restart(net);
     if (err)
       netdev_err(net, "couldn't start device (err %d)\n",
@@ -1012,12 +1058,30 @@ static int x8h7_can_do_get_berr_counter(const struct net_device *net,
   return 0;
 }
 
+/* Phase 07.4.42.2 P0-4 — bounded recovery from a lost H7 status packet
+ * (arduino/portentax8-x8h7#10, portentax8-stm32h7-fw#74). dev_watchdog calls
+ * this from the timer softirq when the queue has been stopped for longer than
+ * the X8H7_CAN_TX_WATCHDOG_MS deadline. The ring is reset (all echoes
+ * dropped) and the queue woken — except in BUS_OFF, where only a successful
+ * restart may wake it (the H7 has not been re-initialised). Note: dev_watchdog prints a one-time
+ * "NETDEV WATCHDOG ... transmit queue 0 timed out" WARN before calling us. */
+static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
+{
+  struct x8h7_can_priv *priv = netdev_priv(net);
+
+  x8h7_can_tx_ring_reset(priv, priv->can.state != CAN_STATE_BUS_OFF);
+  net->stats.tx_errors++;
+  if (net_ratelimit())
+    netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s\n", "07.4.42.2 P0-4");
+}
+
 /**
  */
 static const struct net_device_ops x8h7_can_netdev_ops = {
   .ndo_open       = x8h7_can_open,
   .ndo_stop       = x8h7_can_stop,
   .ndo_start_xmit = x8h7_can_start_xmit,
+  .ndo_tx_timeout = x8h7_can_tx_timeout,
   //.ndo_change_mtu = can_change_mtu,
 };
 
@@ -1230,15 +1294,18 @@ static int x8h7_can_probe(struct platform_device *pdev)
     DBG_PRINT("fdcan_clk = %d", clock_freq);
   }
 
-  /* Phase 7.4.42 Patch 0089 — TX batching requires N outstanding echo skbs
-   * (one per batched frame); bump max_tx_echo_skbs from 1 → X8H7_CAN_BATCH_MAX
-   * so can_put_echo_skb(net, idx, 0) succeeds for idx 0..BATCH_MAX-1 */
-  net = alloc_candev(sizeof(struct x8h7_can_priv), X8H7_CAN_BATCH_MAX);
+  /* Phase 07.4.42.2 P0-4 — one echo skb per TX ring slot (slot index ==
+   * echo index), so can_put_echo_skb(net, idx, 0) is valid for
+   * idx 0..X8H7_CAN_TX_RING_SIZE-1. */
+  net = alloc_candev(sizeof(struct x8h7_can_priv), X8H7_CAN_TX_RING_SIZE);
   if (!net) {
     return -ENOMEM;
   }
 
   net->netdev_ops = &x8h7_can_netdev_ops;
+  /* ndo_tx_timeout deadline. dev_watchdog re-arms itself with round_jiffies(),
+   * so the effective detection latency is 50 ms .. ~1 s. */
+  net->watchdog_timeo = msecs_to_jiffies(X8H7_CAN_TX_WATCHDOG_MS);
   net->flags |= IFF_ECHO;
   net->sysfs_groups[0] = &x8h7_can_sysfs_attr_group;
 

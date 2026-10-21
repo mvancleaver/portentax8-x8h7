@@ -60,24 +60,43 @@
 
 #define X8H7_TX_FIFO_SIZE  32
 
-/* Phase 7.4.42 Patch 0089 — TX batching for sustained 6-motor production load.
- * Multiple start_xmit() invocations accumulate into priv->tx_ring; the work
- * handler drains the ring via x8h7_pkt_send_defer (per-frame) + one final
- * x8h7_pkt_send_now (single SPI exchange carries N CAN frames).
+/* Phase 7.4.42 Patch 0089 / Phase 07.4.42.2 P0-4 — TX batching.
+ * start_xmit() appends to priv->tx_ring; the work handler drains up to
+ * X8H7_CAN_BATCH_MAX frames per SPI exchange via x8h7_pkt_send_defer
+ * (per-frame) + one final x8h7_pkt_send_now.
  *
- * BATCH_MAX must be <= X8H7_TX_FIFO_SIZE (32) and must fit alongside other
- * peripherals' subpkts in spidev->x8h7_txb (X8H7_BUF_SIZE = 256). With
- * X8H7_CAN_HEADER_SIZE + X8H7_CAN_FRAME_MAX_DATA_LEN = 70 + ~4-byte subpkt
- * header per frame, 6 frames worst-case = 444 bytes which exceeds 256.
- * In practice motor SET_TARGETS frames are 8-12 bytes payload, so 6 fit
- * comfortably in the buffer (~120-150 bytes). For larger payloads the H7
- * x8h7_pkt_enq returns -ENOMEM and we flush early.
+ * X8H7_CAN_BATCH_MAX = max frames per SPI flush. Production SET_TARGETS
+ * frames are 6 + 16 B + 4 B subpacket header = 26 B, so 8 frames = 208 B
+ * <= the 252 B SPI payload (X8H7_BUF_SIZE 256 - 4 B packet header). Larger
+ * frames are limited by X8H7_CAN_SPI_BUDGET below and/or hit x8h7_pkt_enq
+ * -ENOMEM; the remainder is flushed in a following exchange. 8 equals the
+ * FDCAN2 Tx FIFO half-depth after the 07.4.42.2 H7 repartition (Tx 16).
  *
  * BATCH_DEADLINE_NS bounds TX latency for partial batches at low rate.
  * 500 us = 10% of 5 ms (200 Hz wheel period); acceptable per control budget.
  */
-#define X8H7_CAN_BATCH_MAX         6
+#define X8H7_CAN_BATCH_MAX         8
 #define X8H7_CAN_BATCH_DEADLINE_NS 500000  /* 500 us */
+
+/* Phase 07.4.42.2 P0-4 — TX ring (head/tail/inflight, free-running u32
+ * counters masked into the ring). RING_SIZE is also the echo-skb count
+ * passed to alloc_candev(). */
+#define X8H7_CAN_TX_RING_SIZE      16
+#define X8H7_CAN_TX_RING_MASK      (X8H7_CAN_TX_RING_SIZE - 1)
+#define X8H7_CAN_TX_WATCHDOG_MS    50      /* net->watchdog_timeo → ndo_tx_timeout */
+
+/* Bytes one CAN frame occupies in spidev->x8h7_txb: x8h7_subpkt_t (4 B,
+ * private to x8h7_drv.c) + the 6 B frame header + payload. The work handler
+ * stops claiming frames once a batch would exceed X8H7_CAN_SPI_BUDGET
+ * (= X8H7_PKT_SIZE, 248 B) so a normal flush never reaches the
+ * x8h7_pkt_enq -ENOMEM path (which printk()s on the console). */
+#define X8H7_CAN_SUBPKT_HDR_SIZE   4
+#define X8H7_CAN_SPI_BUDGET        248
+
+_Static_assert((X8H7_CAN_TX_RING_SIZE & X8H7_CAN_TX_RING_MASK) == 0,
+               "ring size must be a power of two");
+_Static_assert(X8H7_CAN_BATCH_MAX <= X8H7_CAN_TX_RING_SIZE,
+               "batch must fit the ring");
 
 /**
  * TYPEDEFS
@@ -157,8 +176,6 @@ struct x8h7_can_priv {
   struct device            *dev;
   int                       periph;
 
-  int                       tx_len;
-
   struct workqueue_struct     *wq;
   struct work_struct           work;
 
@@ -181,15 +198,21 @@ struct x8h7_can_priv {
                                            * etc.) — Patch 0089 adds batch ring
                                            * below for start_xmit hot path */
 
-  /* Phase 7.4.42 Patch 0089 — TX batching state.
-   * tx_ring stores N pending TX frames; batch_outstanding counts how many
-   * slots are populated. ring_lock protects both (spinlock; held briefly in
-   * start_xmit + work_handler + status TX_COMPLETE handler; never held while
-   * calling x8h7_pkt_send_defer/now which take the spidev mutex).
+  /* Phase 07.4.42.2 P0-4 — TX ring (replaces Patch 0089's single
+   * outstanding-frame counter, which duplicated, dropped and wedged frames).
+   * Free-running u32 counters, all protected by ring_lock (spin_lock_bh —
+   * there is no hard-IRQ user), compared with unsigned subtraction.
+   * Invariant: tx_inflight <= tx_head <= tx_tail and
+   *            tx_tail - tx_inflight <= X8H7_CAN_TX_RING_SIZE.
+   * Slot i (and echo skb i) = counter & X8H7_CAN_TX_RING_MASK. ring_lock is
+   * never held while calling x8h7_pkt_send_* (spidev mutex, may sleep).
    * batch_timer schedules a deferred flush for partial batches at low rate.
    */
-  union x8h7_can_frame_message tx_ring[X8H7_CAN_BATCH_MAX];
-  atomic_t                     batch_outstanding;
+  union x8h7_can_frame_message tx_ring[X8H7_CAN_TX_RING_SIZE];
+  u32                          tx_tail;      /* next free slot (producer: start_xmit) */
+  u32                          tx_head;      /* next slot to send (work handler) */
+  u32                          tx_inflight;  /* oldest sent-but-unretired slot */
+  u32                          tx_gen;       /* bumped on every ring reset */
   spinlock_t                   ring_lock;
   struct hrtimer               batch_timer;
 
