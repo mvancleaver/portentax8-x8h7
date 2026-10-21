@@ -179,7 +179,8 @@ int x8h7_pkt_enq(uint8_t peripheral, uint8_t opcode, uint16_t size, void *data)
   ptr = spidev->x8h7_txb;
   hdr = (x8h7_pkthdr_t*)ptr;
 
-  if ((hdr->size + sizeof(x8h7_subpkt_t) + size) < X8H7_BUF_SIZE) {
+  /* 07.4.42.2: include the 4-byte packet header in the bound (was an off-by-header overflow of up to 3 bytes) */
+  if ((sizeof(x8h7_pkthdr_t) + hdr->size + sizeof(x8h7_subpkt_t) + size) <= X8H7_BUF_SIZE) {
     ptr += sizeof(x8h7_pkthdr_t) + hdr->size;
     pkt = (x8h7_subpkt_t*)ptr;
     pkt->peripheral = peripheral;
