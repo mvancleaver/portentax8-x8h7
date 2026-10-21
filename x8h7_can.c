@@ -95,6 +95,7 @@ static const struct can_bittiming_const x8h7_can_data_bittiming_const = {
 };
 
 static void x8h7_can_tx_work_handler(struct work_struct *ws);
+static int x8h7_can_hw_setup(struct x8h7_can_priv *priv);
 static void x8h7_can_error_skb(struct net_device *net, int can_id, int data1);
 
 /**
@@ -142,11 +143,18 @@ static char* can_sts(enum can_state sts)
 
 /**
  */
-static void x8h7_can_status(struct x8h7_can_priv *priv, u8 intf, u8 eflag)
+/* Phase 7.4.42.1 Patch 0090 (T4) -- signature widened to accept full packet so
+ * T4 can read pkt->data[2]=TEC and pkt->data[3]=REC guarded by pkt->size >= 4.
+ * Backward compatible: 2-byte status frames (size==2) skip the length-guarded
+ * block; behavior for intf/eflag is unchanged. */
+static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
 {
+  u8 intf  = pkt->data[0];
+  u8 eflag = pkt->data[1];
   struct net_device  *net = priv->net;
   int                 can_id = 0;
   int                 data1 = 0;
+  bool                need_busoff = false;
 
   //DBG_PRINT("\n");
 
@@ -169,6 +177,50 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, u8 intf, u8 eflag)
       data1 |= CAN_ERR_CRTL_TX_OVERFLOW;
       x8h7_can_error_skb(net, can_id, data1);
     }
+    /* Phase 7.4.42.1 Patch 0090 (T3) -- handle FDCAN2 bus-off.
+     * H7 HAL_FDCAN_ErrorStatusCallback (Patch 0091) emits {INT_ERR, TX_BO[, TEC, REC]}
+     * when the FDCAN bus-off state is entered. We transition the kernel
+     * can1 interface to BUS_OFF and call can_bus_off() which arms the
+     * restart_ms timer (restart_ms 100 set by Plan 01 T1).
+     * can_bus_off() bumps can_stats.bus_off and schedules can_do_set_mode
+     * (CAN_MODE_START) after restart_ms -- which calls x8h7_can_do_set_mode
+     * -> x8h7_can_restart -> (via restart_work) x8h7_can_hw_setup.
+     * No new pr_info here (Pitfall 6, ~36 ms/call cost at LmP console). */
+    if (eflag & X8H7_CAN_STS_FLG_TX_BO) {
+      net->stats.rx_errors++;
+      can_id |= CAN_ERR_BUSOFF;
+      x8h7_can_error_skb(net, can_id, data1);
+      priv->can.state = CAN_STATE_BUS_OFF;
+      need_busoff = true;
+    }
+    /* Phase 7.4.42.1 Patch 0090 (T4) -- cache TEC/REC from extended 4-byte payload.
+     * ASVS V5 length-guard: only read data[2]/data[3] when pkt->size >= 4.
+     * Backward compatible: a 2-byte status (T3 only, size==2) skips this block.
+     * No pr_info (Pitfall 6). */
+    if (pkt->size >= 4) {
+      priv->last_tec = pkt->data[2];
+      priv->last_rec = pkt->data[3];
+    }
+    /* Phase 7.4.42.1 Patch 0090 (T3) -- WR-01: error-passive / error-warning state
+     * changes. These blocks are kept INSIDE the INT_ERR guard so they only run when
+     * the H7 actually flagged an error interrupt. A TX_COMPLETE-only status frame
+     * carries pkt->data[1] (eflag) from a different code path and must NOT drive
+     * the kernel CAN state machine. (REVIEW WR-01 fix.) */
+    if (eflag & X8H7_CAN_STS_FLG_TX_EP) {
+      priv->can.state = CAN_STATE_ERROR_PASSIVE;
+    }
+    if (eflag & X8H7_CAN_STS_FLG_EWARN) {
+      /* Stay ERROR_WARNING unless already at ERROR_PASSIVE or BUS_OFF. */
+      if (priv->can.state == CAN_STATE_ERROR_ACTIVE)
+        priv->can.state = CAN_STATE_ERROR_WARNING;
+    }
+    /* Call can_bus_off() outside the INT_ERR block's inner logic but still inside
+     * the INT_ERR guard. need_busoff is only ever set inside this block, so
+     * evaluating it here is functionally identical to evaluating it after.
+     * can_bus_off() does no SPI -- it only arms the restart timer -- so it is
+     * safe to call here. (REVIEW WR-01 rationale: can_bus_off outside SPI context.) */
+    if (need_busoff)
+      can_bus_off(net);
   }
 
   if (intf & X8H7_CAN_STS_INT_TX_COMPLETE) {
@@ -315,7 +367,10 @@ static void x8h7_can_hook(void *arg, x8h7_pkt_t *pkt)
     break;
   case X8H7_CAN_OC_STS:
     DBG_PRINT("received status %02X %02X\n", pkt->data[0], pkt->data[1]);
-    x8h7_can_status(priv, pkt->data[0], pkt->data[1]);
+    /* Phase 7.4.42.1 Patch 0090 (T4) -- pass full pkt so x8h7_can_status
+     * can access size + data[2]/[3] for TEC/REC (length-guarded by size >= 4). */
+    if (pkt->size >= 2)
+      x8h7_can_status(priv, pkt);
     break;
   }
 }
@@ -395,21 +450,58 @@ static void x8h7_can_diag_exit(void) {
  * device (auto-)restart mechanism runs in a timer context =>
  * MUST handle restart with asynchronous spi transfers (if any)
  */
+
+/* Phase 7.4.42.1 Patch 0090 (T3) -- restart_work handler.
+ * Runs in priv->wq workqueue context (WQ_HIGHPRI, off timer/softirq).
+ * x8h7_can_hw_setup() calls x8h7_pkt_send_sync() which takes the spidev
+ * mutex and may sleep -- safe here since we are NOT in timer/atomic context.
+ * After re-init, set CAN_STATE_ERROR_ACTIVE + wake netif queue (these were
+ * already in x8h7_can_restart but ran without the H7 having been re-inited). */
+static void x8h7_can_restart_work_fn(struct work_struct *ws)
+{
+  struct x8h7_can_priv *priv = container_of(ws, struct x8h7_can_priv, restart_work);
+  struct net_device    *net  = priv->net;
+
+  DBG_PRINT("bus-off restart: re-init FDCAN2 via x8h7_can_hw_setup\n");
+  x8h7_can_hw_setup(priv);
+
+  /* Phase 7.4.42.1 Patch 0090 (T4 / WR-02) -- announce recovery to userspace.
+   * Emit a CAN_ERR_RESTARTED error frame so SocketCAN observers (CAN_RAW_ERR_FILTER
+   * already enables CAN_ERR_RESTARTED) see the bus-off->active recovery, activating
+   * the is_restarted WARN branch in diag_can_bus_health (ophanim_system.cpp). */
+  x8h7_can_error_skb(net, CAN_ERR_RESTARTED, 0);
+  /* Reset cached TEC/REC so `ip -d link show can1` berr-counter does not report
+   * stale near-bus-off counters after a healthy restart (addresses REVIEW IN-03). */
+  priv->last_tec = 0;
+  priv->last_rec = 0;
+
+  /* Transition back to ERROR_ACTIVE and wake the TX queue. */
+  priv->can.state = CAN_STATE_ERROR_ACTIVE;
+  netif_wake_queue(net);
+}
+
 static int x8h7_can_restart(struct net_device *net)
 {
-  struct x8h7_can_priv *priv = netdev_priv(net);
+  struct x8h7_can_priv *priv  = netdev_priv(net);
   int err = 0;
 
   DBG_PRINT("\n");
 
-  /* @TODO: notify external hw? */
-  DBG_PRINT("@TODO: notify external hw?\n");
-
-  /* finally MUST update can state */
-	priv->can.state = CAN_STATE_ERROR_ACTIVE;
-
-  /* netdev queue can be awaken now */
-	netif_wake_queue(net);
+  /* Phase 7.4.42.1 Patch 0090 (T3) -- context-safe H7 re-init.
+   * x8h7_can_restart runs in timer context (can_dev restart timer, see
+   * comment at :394-397 above). We MUST NOT call x8h7_pkt_send_sync here
+   * as it takes the spidev mutex and may sleep (timer context = atomic).
+   * Use queue_work to defer x8h7_can_hw_setup() off the timer context.
+   * Guard: if wq is NULL (x8h7_can_stop already ran) skip to avoid
+   * use-after-free -- the bus is already being torn down. */
+  if (priv->wq) {
+    queue_work(priv->wq, &priv->restart_work);
+  } else {
+    netdev_warn(net, "x8h7_can_restart: wq=NULL (stop in progress), skipping H7 re-init\n");
+    /* Still update state so the kernel CAN core is consistent. */
+    priv->can.state = CAN_STATE_ERROR_ACTIVE;
+    netif_wake_queue(net);
+  }
 
   return err;
 }
@@ -562,6 +654,7 @@ static int x8h7_can_open(struct net_device *net)
     goto out_clean;
   }
   INIT_WORK(&priv->work, x8h7_can_tx_work_handler);
+  INIT_WORK(&priv->restart_work, x8h7_can_restart_work_fn);
 
   mutex_init(&priv->lock);
 
@@ -909,9 +1002,12 @@ static int x8h7_can_do_set_mode(struct net_device *net, enum can_mode mode)
 static int x8h7_can_do_get_berr_counter(const struct net_device *net,
                                         struct can_berr_counter *bec)
 {
-  //@TODO: to be read from device
-  bec->txerr = 0;
-  bec->rxerr = 0;
+  struct x8h7_can_priv *priv = netdev_priv((struct net_device *)net);
+  /* Phase 7.4.42.1 Patch 0090 (T4) -- return real TEC/REC cached by
+   * x8h7_can_status() from the 4-byte H7 status payload (Patch 0091 T4).
+   * Updated on every error-state-change (low-rate; no per-frame cost). */
+  bec->txerr = priv->last_tec;
+  bec->rxerr = priv->last_rec;
 
   return 0;
 }

@@ -161,6 +161,21 @@ struct x8h7_can_priv {
 
   struct workqueue_struct     *wq;
   struct work_struct           work;
+
+  /* Phase 7.4.42.1 Patch 0090 (T3) -- bus-off restart work item.
+   * Deferred from the can_dev timer context (x8h7_can_restart) onto priv->wq
+   * so x8h7_can_hw_setup (which calls x8h7_pkt_send_sync; may sleep) runs
+   * off the timer/softirq stack. Initialized in x8h7_can_open alongside work. */
+  struct work_struct           restart_work;
+
+  /* Phase 7.4.42.1 Patch 0090 (T4) -- TEC/REC berr cache.
+   * Written by x8h7_can_status() from 4-byte H7 status payload (Patch 0091 T4).
+   * Read by do_get_berr_counter() to populate `ip -d link show can1` berr-counter.
+   * Updated on error-state-change only (not per-frame -- Pitfall 6).
+   * ASVS V5: only written when pkt->size >= 4 (length-guard against short frames). */
+  u8 last_tec;
+  u8 last_rec;
+
   union x8h7_can_frame_message tx_frame;  /* legacy single-slot; preserved for
                                            * non-batched paths (status frame,
                                            * etc.) — Patch 0089 adds batch ring
