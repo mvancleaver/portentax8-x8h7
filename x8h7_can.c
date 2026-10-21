@@ -781,6 +781,7 @@ static int x8h7_can_open(struct net_device *net)
 
 out_free_wq:
   destroy_workqueue(priv->wq);
+  priv->wq = NULL;   /* 07.4.42.2 REVIEW IN-03: x8h7_can_restart() and the batch timer test priv->wq */
 out_clean:
   x8h7_hook_set(priv->periph, NULL, NULL);
   close_candev(net);
