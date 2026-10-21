@@ -261,10 +261,20 @@ static void x8h7_can_error_state(struct x8h7_can_priv *priv, u8 flags, u8 tec, u
      * ring_lock and in the same thread as x8h7_can_tx_retire(), so no echo is
      * in flight when that flush runs. priv->can.state is already BUS_OFF
      * (can_change_state() above), so start_xmit drops every frame from now on
-     * instead of storing an echo; only the restart path wakes the queue
-     * (x8h7_can_restart_work_fn). */
-    netif_stop_queue(net);
-    x8h7_can_tx_ring_reset(priv, false);
+     * instead of storing an echo.
+     *
+     * The queue is deliberately left AWAKE (ring reset with wake=true, even if
+     * a full ring had stopped it): a stopped queue parks up to txqueuelen
+     * (128) frames in the qdisc for the whole restart_ms window, and
+     * carrier-off is a non-urgent linkwatch event (net/core/link_watch.c,
+     * rate-limited to 1/s) so dev_deactivate() may or may not flush them
+     * before the restart wakes the queue -- a replay of ~43 ms of stale
+     * MD80 SET_TARGETS into freshly restarted motors, timing-dependent.
+     * With the queue awake every frame reaches start_xmit and is dropped
+     * (tx_dropped) deterministically while BUS_OFF; the ring stays empty.
+     * x8h7_can_restart() stops the queue only for the H7 re-init itself and
+     * x8h7_can_restart_work_fn() publishes ERROR_ACTIVE + wakes it. */
+    x8h7_can_tx_ring_reset(priv, true);
     can_bus_off(net);   /* carrier off + restart_ms timer; no SPI */
   }
 }
@@ -569,10 +579,11 @@ static void x8h7_can_restart_work_fn(struct work_struct *ws)
   priv->last_tec = 0;
   priv->last_rec = 0;
 
-  /* Frames that slipped in between the CAN_MODE_START ring reset and the
-   * queue stop in x8h7_can_restart() (linkwatch may keep the qdisc active for
-   * up to ~1 s after carrier-off) went to an H7 that was just re-initialised:
-   * drop them so the ring is exactly empty when the queue is woken. */
+  /* Defensive: priv->can.state is still BUS_OFF here (the 6.1 core
+   * can_restart() does not touch it), so start_xmit has dropped everything
+   * since bus-off entry and the ring should already be empty. Reset it anyway
+   * so the ring is exactly empty when ERROR_ACTIVE is published and the queue
+   * is woken below. */
   x8h7_can_tx_ring_reset(priv, false);
 
   /* Transition back to ERROR_ACTIVE and wake the TX queue. The state is
@@ -596,8 +607,12 @@ static int x8h7_can_restart(struct net_device *net)
    * already ran) skip to avoid use-after-free — the bus is being torn down.
    * Phase 07.4.42.2: keep start_xmit out until restart_work has re-initialised
    * the H7 (the core turns the carrier back on as soon as we return), so no
-   * frame races the DEINIT/INIT pair. netif_trans_update() stops dev_watchdog
-   * from treating the stopped queue as a TX stall in the meantime. */
+   * frame races the DEINIT/INIT pair. This is the ONLY place the queue is
+   * stopped for bus-off (entry keeps it awake so start_xmit drops; see
+   * x8h7_can_error_state()); the window is bounded by the H7 re-init and
+   * restart_work_fn resets the ring before waking, so nothing parked here can
+   * replay. netif_trans_update() stops dev_watchdog from treating the stopped
+   * queue as a TX stall in the meantime. */
   if (priv->wq) {
     netif_trans_update(net);
     netif_stop_queue(net);
@@ -870,8 +885,11 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
   if (READ_ONCE(priv->can.state) == CAN_STATE_BUS_OFF) {
     /* 07.4.42.2 REVIEW CR-01 — no new echo while bus-off: the ring was
      * emptied at bus-off entry and the core can_restart() flushes the echo
-     * slots with no driver lock. x8h7_can_restart_work_fn() publishes
-     * ERROR_ACTIVE under ring_lock once the H7 has been re-initialised. */
+     * slots with no driver lock. The queue is kept awake in BUS_OFF on
+     * purpose so every frame lands here and is dropped NOW rather than
+     * parked in the qdisc and replayed after the restart (stale motor
+     * targets). x8h7_can_restart_work_fn() publishes ERROR_ACTIVE under
+     * ring_lock once the H7 has been re-initialised. */
     net->stats.tx_dropped++;
     spin_unlock_bh(&priv->ring_lock);
     kfree_skb(skb);
