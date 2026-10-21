@@ -273,19 +273,30 @@ static int pkt_parse(struct spidev_data *spidev)
   x8h7_pkthdr_t  *hdr;
   x8h7_subpkt_t  *pkt;
   uint8_t        *ptr;
+  uint8_t const  *end;
   uint16_t        size;
+  uint32_t        used;
   int             i;
 
   pkt_dump("Parse", spidev->x8h7_rxb);
 
   ptr = spidev->x8h7_rxb;
+  end = spidev->x8h7_rxb + X8H7_BUF_SIZE;
   hdr = (x8h7_pkthdr_t*)ptr;
   size = hdr->size;
   ptr += sizeof(x8h7_pkthdr_t);
 
   /* Loop to parse data from h7 and dispatch to correct peripheral */
   do {
+    /* 07.4.42.2 REVIEW WR-04: hdr->size and pkt->size come from the wire
+     * unchecked (an H7 enqueue_packet() without the subpacket-header bound
+     * could claim up to 256 data bytes). Never read a subpacket header or its
+     * payload past the X8H7_BUF_SIZE rx buffer. */
+    if ((size_t)(end - ptr) < sizeof(x8h7_subpkt_t))
+      return 0;   /* subpacket header would end past the rx buffer */
     pkt = (x8h7_subpkt_t*)ptr;
+    if (pkt->size > (size_t)(end - ptr) - sizeof(x8h7_subpkt_t))
+      return 0;   /* payload would end past the rx buffer */
     ptr += sizeof(x8h7_subpkt_t);
 
     i = pkt->peripheral;
@@ -308,7 +319,10 @@ static int pkt_parse(struct spidev_data *spidev)
     }
 
     ptr += pkt->size;
-    size -= (sizeof(x8h7_subpkt_t) + pkt->size);
+    /* 07.4.42.2 REVIEW WR-04: no uint16_t wrap when a subpacket claims more
+     * than the remaining declared length — stop instead of walking on. */
+    used = sizeof(x8h7_subpkt_t) + pkt->size;
+    size = (used < size) ? (uint16_t)(size - used) : 0;
   } while (size > 0);
 
   return 0;
