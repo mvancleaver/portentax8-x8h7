@@ -183,8 +183,11 @@ static void x8h7_can_tx_retire(struct x8h7_can_priv *priv, u32 count, bool ok)
  * concurrently running work handler not to un-claim or re-queue the frames it
  * snapshotted before the reset. All echo slots are freed (self-healing even if
  * an echo leaked outside [tx_inflight, tx_tail)); tx_dropped counts only slots
- * that still held an echo — close_candev()/can_restart() have already flushed
- * and counted theirs via can_flush_echo_skb(). */
+ * that still held an echo. REVIEW CR-01: this is the only echo flush that is
+ * serialised with x8h7_can_tx_retire() (ring_lock). ndo_stop and the BUS_OFF
+ * entry run it BEFORE the core's lock-free can_flush_echo_skb()
+ * (close_candev() / can_restart()), so that flush always finds every slot
+ * empty. */
 static void x8h7_can_tx_ring_reset(struct x8h7_can_priv *priv, bool wake)
 {
   struct net_device *net = priv->net;
@@ -252,8 +255,18 @@ static void x8h7_can_error_state(struct x8h7_can_priv *priv, u8 flags, u8 tec, u
     cf->data[7] = rec;
     netif_rx(skb);
   }
-  if (new_state == CAN_STATE_BUS_OFF)
+  if (new_state == CAN_STATE_BUS_OFF) {
+    /* 07.4.42.2 REVIEW CR-01 — the core can_restart() (restart_ms work) runs
+     * can_flush_echo_skb() with no driver lock. Empty the ring here, under
+     * ring_lock and in the same thread as x8h7_can_tx_retire(), so no echo is
+     * in flight when that flush runs. priv->can.state is already BUS_OFF
+     * (can_change_state() above), so start_xmit drops every frame from now on
+     * instead of storing an echo; only the restart path wakes the queue
+     * (x8h7_can_restart_work_fn). */
+    netif_stop_queue(net);
+    x8h7_can_tx_ring_reset(priv, false);
     can_bus_off(net);   /* carrier off + restart_ms timer; no SPI */
+  }
 }
 
 /* Phase 07.4.42.2 — CAN_STATUS (opcode 0x40, H7 -> kernel) per the shared
@@ -562,8 +575,12 @@ static void x8h7_can_restart_work_fn(struct work_struct *ws)
    * drop them so the ring is exactly empty when the queue is woken. */
   x8h7_can_tx_ring_reset(priv, false);
 
-  /* Transition back to ERROR_ACTIVE and wake the TX queue. */
-  priv->can.state = CAN_STATE_ERROR_ACTIVE;
+  /* Transition back to ERROR_ACTIVE and wake the TX queue. The state is
+   * published under ring_lock (REVIEW CR-01): start_xmit tests it under the
+   * same lock, so it stops dropping only after the ring reset above. */
+  spin_lock_bh(&priv->ring_lock);
+  WRITE_ONCE(priv->can.state, CAN_STATE_ERROR_ACTIVE);
+  spin_unlock_bh(&priv->ring_lock);
   netif_wake_queue(net);
 }
 
@@ -727,8 +744,8 @@ static int x8h7_can_open(struct net_device *net)
    * spinlock (not mutex): start_xmit runs with BH disabled and lock holders
    * are short (ring indices + tx_ring copies; NEVER held while calling
    * x8h7_pkt_send_defer/now which take the spidev mutex and may sleep).
-   * Echo slots are empty here (close_candev() flushed them at the last stop),
-   * so the counters restart at 0. */
+   * Echo slots are empty here (x8h7_can_stop() emptied the ring at the last
+   * stop, REVIEW CR-01), so the counters restart at 0. */
   spin_lock_init(&priv->ring_lock);
   priv->tx_tail = priv->tx_head = priv->tx_inflight = 0;
   priv->tx_gen = 0;
@@ -781,7 +798,20 @@ static int x8h7_can_stop(struct net_device *net)
 
   /* Notify upper level */
   netif_stop_queue(net);
-  close_candev(net);   /* cancels the core restart work + flushes echo skbs */
+
+  /* 07.4.42.2 REVIEW CR-01 — close_candev() runs the core
+   * can_flush_echo_skb() with no driver lock, while the x8h7 threaded IRQ
+   * retires echo slots under ring_lock. Detach the hook first (no new
+   * TX-status retire), then empty the ring under ring_lock: every echo is
+   * freed and tx_inflight = tx_tail, so a retire that is already running
+   * clamps to 0. __dev_close_many() quiesced start_xmit before ndo_stop, so
+   * no new echo can be stored after this reset, and the core flush below
+   * finds every slot empty. The reset also drops anything still queued, so a
+   * later open starts clean (P0-4). */
+  x8h7_hook_set(priv->periph, NULL, NULL);
+  x8h7_can_tx_ring_reset(priv, false);
+
+  close_candev(net);   /* cancels the core restart work; its echo flush is now a no-op */
 
   /* 07.4.42.2: a bus-off restart_work still queued must not re-init the H7
    * (and wake the queue) after the DEINIT below. */
@@ -793,12 +823,9 @@ static int x8h7_can_stop(struct net_device *net)
   /* Phase 7.4.42 Patch 0089 — cancel batch flush timer BEFORE destroying
    * workqueue. hrtimer_cancel() is safe to call even if timer never fired. */
   hrtimer_cancel(&priv->batch_timer);
-  /* 07.4.42.2 P0-4 — drop anything still queued so a later open starts clean. */
-  x8h7_can_tx_ring_reset(priv, false);
 
   /* Free priv. resources */
   mutex_lock(&priv->lock);
-  x8h7_hook_set(priv->periph, NULL, NULL);
   destroy_workqueue(priv->wq);
   priv->wq = NULL;
 
@@ -839,6 +866,16 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
    * after it was retired (no "echo_skb is occupied"). The work handler sends
    * [tx_head, tx_tail); the status handler retires from tx_inflight. */
   spin_lock_bh(&priv->ring_lock);
+  if (READ_ONCE(priv->can.state) == CAN_STATE_BUS_OFF) {
+    /* 07.4.42.2 REVIEW CR-01 — no new echo while bus-off: the ring was
+     * emptied at bus-off entry and the core can_restart() flushes the echo
+     * slots with no driver lock. x8h7_can_restart_work_fn() publishes
+     * ERROR_ACTIVE under ring_lock once the H7 has been re-initialised. */
+    net->stats.tx_dropped++;
+    spin_unlock_bh(&priv->ring_lock);
+    kfree_skb(skb);
+    return NETDEV_TX_OK;
+  }
   if (priv->tx_tail - priv->tx_inflight >= X8H7_CAN_TX_RING_SIZE) {
     /* Ring full — normally unreachable (we stop the queue when the last slot
      * is taken below). */
@@ -1027,9 +1064,12 @@ static int x8h7_can_do_set_mode(struct net_device *net, enum can_mode mode)
 
   switch (mode) {
   case CAN_MODE_START:
-    /* 07.4.42.2 P0-4 scenario 5 — the core can_restart() already flushed the
-     * echo skbs; resynchronise the ring indices and drop every pre-bus-off
-     * command so nothing stale is replayed after the restart. */
+    /* 07.4.42.2 P0-4 scenario 5 / REVIEW CR-01 — the ring was already
+     * emptied at bus-off entry (x8h7_can_error_state) and start_xmit drops
+     * while bus-off, so the core can_restart()'s lock-free
+     * can_flush_echo_skb() found no echo. Resynchronise the ring indices and
+     * drop every pre-bus-off command so nothing stale is replayed after the
+     * restart. */
     x8h7_can_tx_ring_reset(netdev_priv(net), false);
     err = x8h7_can_restart(net);
     if (err)
