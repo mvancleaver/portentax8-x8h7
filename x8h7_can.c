@@ -4,6 +4,7 @@
 
 #include <linux/kthread.h>
 #include <linux/ktime.h>
+#include <asm/unaligned.h>
 #include <linux/sched.h>
 #include "x8h7_can.h"
 
@@ -306,9 +307,20 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
   u8                 intf  = pkt->data[0];
   u8                 eflag = pkt->data[1];
 
-  if (intf == 0x20 && pkt->size >= 8) {
-    /* 2026-10-22 diag: H7 heartbeat {0x20, seq, loop8, txsub8, txrep8, rxfr8, repulse8, spierr8} every 100 ms */
+  if (intf == 0x20 && pkt->size >= 12) {
+    /* 2026-10-22 diag v2: H7 heartbeat {0x20, seq, loop16, spierr16, rxfr16, txsub16, repulse16} every 100 ms.
+     * A gap > 150 ms is logged with the counter deltas: loop delta 0 = the H7 main loop was stalled. */
+    u16 const f[5] = { get_unaligned_le16(pkt->data + 2), get_unaligned_le16(pkt->data + 4),
+                       get_unaligned_le16(pkt->data + 6), get_unaligned_le16(pkt->data + 8),
+                       get_unaligned_le16(pkt->data + 10) };
+    unsigned int const age = priv->hb_count ? jiffies_to_msecs(jiffies - priv->hb_jiffies) : 0;
+    if (priv->hb_count && age > 150 && net_ratelimit())
+      netdev_warn(net, "H7 heartbeat gap %u ms (seq %u->%u): d_loop %u d_spierr %u d_rxfr %u d_txsub %u d_repulse %u\n",
+                  age, priv->hb_last[1], pkt->data[1],
+                  (u16)(f[0] - priv->hb_v2[0]), (u16)(f[1] - priv->hb_v2[1]), (u16)(f[2] - priv->hb_v2[2]),
+                  (u16)(f[3] - priv->hb_v2[3]), (u16)(f[4] - priv->hb_v2[4]));
     memcpy(priv->hb_last, pkt->data, 8);
+    memcpy(priv->hb_v2, f, sizeof(f));
     priv->hb_jiffies = jiffies;
     priv->hb_count++;
     return;
@@ -1162,10 +1174,10 @@ static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
   net->stats.tx_errors++;
   if (net_ratelimit())
     netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s; H7 heartbeat #%u age %u ms "
-                "{seq %u loop %u txsub %u txrep %u rxfr %u repulse %u spierr %u}; slow xchg %u max %lld us\n",
+                "{seq %u loop %u spierr %u rxfr %u txsub %u repulse %u}; slow xchg %u max %lld us\n",
                 "07.4.42.2 P0-4", priv->hb_count, jiffies_to_msecs(jiffies - priv->hb_jiffies),
-                priv->hb_last[1], priv->hb_last[2], priv->hb_last[3], priv->hb_last[4], priv->hb_last[5],
-                priv->hb_last[6], priv->hb_last[7], priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us);
+                priv->hb_last[1], priv->hb_v2[0], priv->hb_v2[1], priv->hb_v2[2], priv->hb_v2[3], priv->hb_v2[4],
+                priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us);
 }
 
 /**

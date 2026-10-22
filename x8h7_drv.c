@@ -361,7 +361,7 @@ int x8h7_spi_trx(struct spi_device *spi,
     static ktime_t last_end;
     s64 const since = ktime_us_delta(ktime_get(), last_end);
     if (last_end && since >= 0 && since < X8H7_SPI_MIN_GAP_US)
-      usleep_range(X8H7_SPI_MIN_GAP_US - since, X8H7_SPI_MIN_GAP_US - since + 20);
+      udelay(X8H7_SPI_MIN_GAP_US - since);   /* bounded busy-wait: usleep_range overshot by ms on this kernel */
     ret = spi_sync(spi, &m);
     last_end = ktime_get();
   }
