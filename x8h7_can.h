@@ -13,6 +13,7 @@
 #include <linux/hrtimer.h>
 #include <linux/can/dev.h>
 #include <linux/workqueue.h>
+#include <linux/kthread.h>
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 
@@ -176,14 +177,18 @@ struct x8h7_can_priv {
   struct device            *dev;
   int                       periph;
 
-  struct workqueue_struct     *wq;
-  struct work_struct           work;
+  /* 07.4.42.2 bench 2026-10-22: the TX path runs on a DEDICATED kthread_worker (named
+   * "x8h7cantx-<if>", SCHED_FIFO 50 by default, raised to io-thread+1 by x8-rt-promote.sh),
+   * not a per-CPU CFS workqueue: a SCHED_FIFO userspace writer on the same CPU starved the
+   * kworker and the drain fell from 3000 to ~940 requests/s (raw sender at FIFO 90: 9000 -> ~500). */
+  struct kthread_worker       *wq;
+  struct kthread_work          work;
 
   /* Phase 7.4.42.1 Patch 0090 (T3) -- bus-off restart work item.
    * Deferred from the can_dev timer context (x8h7_can_restart) onto priv->wq
    * so x8h7_can_hw_setup (which calls x8h7_pkt_send_sync; may sleep) runs
    * off the timer/softirq stack. Initialized in x8h7_can_open alongside work. */
-  struct work_struct           restart_work;
+  struct kthread_work          restart_work;
 
   /* Phase 7.4.42.1 Patch 0090 (T4) -- TEC/REC berr cache.
    * Written by x8h7_can_status() from 4-byte H7 status payload (Patch 0091 T4).

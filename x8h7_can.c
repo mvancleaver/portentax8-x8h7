@@ -2,6 +2,8 @@
  * X8H7 CAN driver
  */
 
+#include <linux/kthread.h>
+#include <linux/sched.h>
 #include "x8h7_can.h"
 
 #include <linux/can/core.h>
@@ -94,7 +96,7 @@ static const struct can_bittiming_const x8h7_can_data_bittiming_const = {
   .brp_inc   =  1,
 };
 
-static void x8h7_can_tx_work_handler(struct work_struct *ws);
+static void x8h7_can_tx_work_handler(struct kthread_work *ws);
 static int x8h7_can_hw_setup(struct x8h7_can_priv *priv);
 static int x8h7_can_hw_stop(struct x8h7_can_priv *priv);
 static void x8h7_can_error_skb(struct net_device *net, int can_id, int data1);
@@ -557,7 +559,7 @@ static void x8h7_can_diag_exit(void) {
  * call x8h7_pkt_send_sync(), which takes the spidev mutex and may sleep —
  * safe here. The TX queue was stopped by x8h7_can_restart() and is woken only
  * once the H7 has been re-initialised. */
-static void x8h7_can_restart_work_fn(struct work_struct *ws)
+static void x8h7_can_restart_work_fn(struct kthread_work *ws)
 {
   struct x8h7_can_priv *priv = container_of(ws, struct x8h7_can_priv, restart_work);
   struct net_device    *net  = priv->net;
@@ -616,7 +618,7 @@ static int x8h7_can_restart(struct net_device *net)
   if (priv->wq) {
     netif_trans_update(net);
     netif_stop_queue(net);
-    queue_work(priv->wq, &priv->restart_work);
+    kthread_queue_work(priv->wq, &priv->restart_work);
   } else {
     netdev_warn(net, "x8h7_can_restart: wq=NULL (stop in progress), skipping H7 re-init\n");
     /* Still update state so the kernel CAN core is consistent. */
@@ -767,13 +769,17 @@ static int x8h7_can_open(struct net_device *net)
   hrtimer_init(&priv->batch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
   priv->batch_timer.function = x8h7_can_batch_timer_cb;
 
-  priv->wq = alloc_workqueue("x8h7_can_wq", WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
-  if (!priv->wq) {
+  /* 07.4.42.2 bench 2026-10-22: dedicated SCHED_FIFO kthread (see x8h7_can.h). comm is 15 chars:
+   * "x8h7cantx-can1". x8-rt-promote.sh raises it to io-thread+1 (91 with --prio 95). */
+  priv->wq = kthread_create_worker(0, "x8h7cantx-%s", net->name);
+  if (IS_ERR_OR_NULL(priv->wq)) {
+    priv->wq = NULL;
     ret = -ENOMEM;
     goto out_clean;
   }
-  INIT_WORK(&priv->work, x8h7_can_tx_work_handler);
-  INIT_WORK(&priv->restart_work, x8h7_can_restart_work_fn);
+  sched_set_fifo(priv->wq->task);   /* FIFO 50 by default; above every CFS task, below irq/<n>-x8h7 */
+  kthread_init_work(&priv->work, x8h7_can_tx_work_handler);
+  kthread_init_work(&priv->restart_work, x8h7_can_restart_work_fn);
 
   mutex_init(&priv->lock);
 
@@ -795,7 +801,7 @@ static int x8h7_can_open(struct net_device *net)
   return 0;
 
 out_free_wq:
-  destroy_workqueue(priv->wq);
+  kthread_destroy_worker(priv->wq);
   priv->wq = NULL;   /* 07.4.42.2 REVIEW IN-03: x8h7_can_restart() and the batch timer test priv->wq */
 out_clean:
   x8h7_hook_set(priv->periph, NULL, NULL);
@@ -831,7 +837,7 @@ static int x8h7_can_stop(struct net_device *net)
 
   /* 07.4.42.2: a bus-off restart_work still queued must not re-init the H7
    * (and wake the queue) after the DEINIT below. */
-  cancel_work_sync(&priv->restart_work);
+  kthread_cancel_work_sync(&priv->restart_work);
 
   /* Notify ext. hw to stop can peripheral */
   x8h7_can_hw_stop(priv);
@@ -842,7 +848,7 @@ static int x8h7_can_stop(struct net_device *net)
 
   /* Free priv. resources */
   mutex_lock(&priv->lock);
-  destroy_workqueue(priv->wq);
+  kthread_destroy_worker(priv->wq);
   priv->wq = NULL;
 
   priv->can.state = CAN_STATE_STOPPED;
@@ -919,7 +925,7 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
   if (pending >= X8H7_CAN_BATCH_MAX) {
     /* Full batch — flush now; the immediate queue_work supersedes the timer. */
     hrtimer_try_to_cancel(&priv->batch_timer);
-    queue_work(priv->wq, &priv->work);
+    kthread_queue_work(priv->wq, &priv->work);
   } else if (!hrtimer_is_queued(&priv->batch_timer)) {
     /* Partial batch — arm the deadline timer so it flushes even at low TX
      * rate. hrtimer_is_queued (not hrtimer_active): re-arming while the
@@ -964,7 +970,7 @@ static netdev_tx_t x8h7_can_start_xmit(struct sk_buff *skb,
  * exchange would require relying on the next IRQ-driven exchange to flush
  * pending TX (deadlock risk if no IRQ arrives — out of scope for Plan 02).
  */
-static void x8h7_can_tx_work_handler(struct work_struct *ws)
+static void x8h7_can_tx_work_handler(struct kthread_work *ws)
 {
   struct x8h7_can_priv *priv = container_of(ws, struct x8h7_can_priv, work);
   /* Phase 7.4.42 Patch 0089 / 07.4.42.2 P0-4: up to X8H7_CAN_BATCH_MAX frames
@@ -1023,7 +1029,7 @@ static void x8h7_can_tx_work_handler(struct work_struct *ws)
 #endif
 
   if (more && priv->wq)
-    queue_work(priv->wq, &priv->work);
+    kthread_queue_work(priv->wq, &priv->work);
 }
 
 /* Phase 7.4.42 Patch 0089 — hrtimer callback for partial-batch flush.
@@ -1038,7 +1044,7 @@ static enum hrtimer_restart x8h7_can_batch_timer_cb(struct hrtimer *t)
   /* Only queue work if the workqueue is still alive (not destroyed by
    * x8h7_can_stop). priv->wq is set to NULL in stop; check before use. */
   if (priv->wq) {
-    queue_work(priv->wq, &priv->work);
+    kthread_queue_work(priv->wq, &priv->work);
   }
   return HRTIMER_NORESTART;
 }
