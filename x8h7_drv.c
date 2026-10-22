@@ -40,6 +40,17 @@
 #ifndef X8H7_SPI_MIN_GAP_US
 #define X8H7_SPI_MIN_GAP_US 200   /* us between consecutive SPI exchanges (H7 DMA re-arm window) */
 #endif
+/* 2026-10-22 (07.4.42.2 item 8): runtime-tunable copies — /sys/module/x8h7_drv/parameters/{min_gap_us,spi_hz}.
+ * Tune while watching the H7 heartbeat spierr counter (x8h7_can hb_log_every): a gap too short for the H7 to re-arm
+ * its SPI DMA shows up there as overruns. spi_hz 0 = device-tree spi-max-frequency. */
+static unsigned int min_gap_us = X8H7_SPI_MIN_GAP_US;
+module_param(min_gap_us, uint, 0644);
+MODULE_PARM_DESC(min_gap_us, "minimum gap between consecutive SPI exchanges in us (0 = none)");
+static unsigned int spi_hz = 0;
+module_param(spi_hz, uint, 0644);
+MODULE_PARM_DESC(spi_hz, "SPI clock override in Hz (0 = device tree spi-max-frequency)");
+#if 0
+#endif
 #include <linux/interrupt.h>
 
 #include <linux/spi/spi.h>
@@ -345,7 +356,7 @@ int x8h7_spi_trx(struct spi_device *spi,
   t.tx_buf = tx_buf;
   t.rx_buf = rx_buf;
   t.len    = len;
-  t.speed_hz = x8h7_spidev->speed_hz;
+  t.speed_hz = spi_hz ? spi_hz : x8h7_spidev->speed_hz;
 
   spi_message_init(&m);
   spi_message_add_tail(&t, &m);
@@ -360,8 +371,9 @@ int x8h7_spi_trx(struct spi_device *spi,
   {
     static ktime_t last_end;
     s64 const since = ktime_us_delta(ktime_get(), last_end);
-    if (last_end && since >= 0 && since < X8H7_SPI_MIN_GAP_US)
-      udelay(X8H7_SPI_MIN_GAP_US - since);   /* bounded busy-wait: usleep_range overshot by ms on this kernel */
+    unsigned int const gap = READ_ONCE(min_gap_us);
+    if (gap && last_end && since >= 0 && since < gap)
+      udelay(gap - since);   /* bounded busy-wait: usleep_range overshot by ms on this kernel */
     ret = spi_sync(spi, &m);
     last_end = ktime_get();
   }

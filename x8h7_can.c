@@ -59,6 +59,12 @@ static struct dentry *x8h7_can_diag_dir  = NULL;
 /* DEBUG HANDLING */
 //#define DEBUG
 #include "debug.h"
+
+/* 2026-10-22 (07.4.42.2 item 8): /sys/module/x8h7_can/parameters/hb_log_every — print the H7 heartbeat counters
+ * every N heartbeats (N*100 ms); 0 = off. Use it while tuning x8h7_drv min_gap_us / spi_hz (spierr = H7 SPI overruns). */
+static unsigned int hb_log_every = 0;
+module_param(hb_log_every, uint, 0644);
+MODULE_PARM_DESC(hb_log_every, "log H7 heartbeat counters every N heartbeats (0 = off)");
 #ifdef DEBUG
   #define DBG_CAN_STATE(d, s) { \
     DBG_PRINT("device %s:CAN State: %d CAN controller %s\n", d, s, can_sts(s)); \
@@ -319,6 +325,11 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
                   age, priv->hb_last[1], pkt->data[1],
                   (u16)(f[0] - priv->hb_v2[0]), (u16)(f[1] - priv->hb_v2[1]), (u16)(f[2] - priv->hb_v2[2]),
                   (u16)(f[3] - priv->hb_v2[3]), (u16)(f[4] - priv->hb_v2[4]));
+    if (hb_log_every && priv->hb_count && (priv->hb_count % hb_log_every) == 0)
+      netdev_info(net, "H7 hb #%u (boot %u): last 100 ms d_loop %u d_spierr %u d_rxfr %u d_txsub %u d_repulse %u; totals spierr %u repulse %u\n",
+                  priv->hb_count, priv->hb_boot_count,
+                  (u16)(f[0] - priv->hb_v2[0]), (u16)(f[1] - priv->hb_v2[1]), (u16)(f[2] - priv->hb_v2[2]),
+                  (u16)(f[3] - priv->hb_v2[3]), (u16)(f[4] - priv->hb_v2[4]), f[1], f[4]);
     memcpy(priv->hb_last, pkt->data, 8);
     memcpy(priv->hb_v2, f, sizeof(f));
     if (pkt->size >= 38) {
