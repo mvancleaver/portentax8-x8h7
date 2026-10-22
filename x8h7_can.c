@@ -321,6 +321,29 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
                   (u16)(f[3] - priv->hb_v2[3]), (u16)(f[4] - priv->hb_v2[4]));
     memcpy(priv->hb_last, pkt->data, 8);
     memcpy(priv->hb_v2, f, sizeof(f));
+    if (pkt->size >= 38) {
+      /* v3 boot report: {reset_cause16, fault_kind8, stage8, pc32, lr32, cfsr32, hfsr32, addr32, boot_count16} */
+      u16 const bc = get_unaligned_le16(pkt->data + 36);
+      if (bc != priv->hb_boot_count || !priv->hb_count) {
+        u16 const rc = get_unaligned_le16(pkt->data + 12);
+        priv->hb_boot_count  = bc;
+        priv->hb_reset_cause = rc;
+        priv->hb_fault_kind  = pkt->data[14];
+        priv->hb_stage       = pkt->data[15];
+        priv->hb_pc   = get_unaligned_le32(pkt->data + 16);
+        priv->hb_lr   = get_unaligned_le32(pkt->data + 20);
+        priv->hb_cfsr = get_unaligned_le32(pkt->data + 24);
+        priv->hb_hfsr = get_unaligned_le32(pkt->data + 28);
+        priv->hb_addr = get_unaligned_le32(pkt->data + 32);
+        /* RCC->RSR bits 16..31: 17 CPU, 19 D1, 20 D2, 21 BOR, 22 PIN, 23 POR, 24 SFT, 26 IWDG1, 28 WWDG1, 30 LPWR */
+        netdev_warn(net, "H7 boot #%u report: reset cause 0x%04x%s%s%s%s%s; last fault kind %u pc 0x%08x lr 0x%08x cfsr 0x%08x hfsr 0x%08x addr 0x%08x; last main-loop stage %u\n",
+                    bc, rc,
+                    (rc & BIT(26 - 16)) ? " IWDG" : "", (rc & BIT(24 - 16)) ? " SFT" : "",
+                    (rc & BIT(22 - 16)) ? " PIN" : "", (rc & BIT(23 - 16)) ? " POR" : "",
+                    (rc & BIT(21 - 16)) ? " BOR" : "",
+                    priv->hb_fault_kind, priv->hb_pc, priv->hb_lr, priv->hb_cfsr, priv->hb_hfsr, priv->hb_addr, priv->hb_stage);
+      }
+    }
     priv->hb_jiffies = jiffies;
     priv->hb_count++;
     return;
@@ -1173,9 +1196,9 @@ static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
   x8h7_can_tx_ring_reset(priv, priv->can.state != CAN_STATE_BUS_OFF);
   net->stats.tx_errors++;
   if (net_ratelimit())
-    netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s; H7 heartbeat #%u age %u ms "
+    netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s; H7 boot #%u heartbeat #%u age %u ms "
                 "{seq %u loop %u spierr %u rxfr %u txsub %u repulse %u}; slow xchg %u max %lld us\n",
-                "07.4.42.2 P0-4", priv->hb_count, jiffies_to_msecs(jiffies - priv->hb_jiffies),
+                "07.4.42.2 P0-4", priv->hb_boot_count, priv->hb_count, jiffies_to_msecs(jiffies - priv->hb_jiffies),
                 priv->hb_last[1], priv->hb_v2[0], priv->hb_v2[1], priv->hb_v2[2], priv->hb_v2[3], priv->hb_v2[4],
                 priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us);
 }

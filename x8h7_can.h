@@ -186,6 +186,10 @@ struct x8h7_can_priv {
   u16                          hb_v2[5];              /* v2 16-bit counters: loop, spierr, rxfr, txsub, repulse */
   unsigned long                hb_jiffies;
   u32                          hb_count;
+  /* v3 boot report (2026-10-22): printed whenever hb_boot_count changes */
+  u16                          hb_boot_count, hb_reset_cause;
+  u8                           hb_fault_kind, hb_stage;
+  u32                          hb_pc, hb_lr, hb_cfsr, hb_hfsr, hb_addr;
   u32                          tx_xchg_slow;          /* count of exchanges > 2 ms */
   struct kthread_worker       *wq;
   struct kthread_work          work;
