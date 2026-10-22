@@ -43,7 +43,10 @@
 /* 2026-10-22 (07.4.42.2 item 8): runtime-tunable copies — /sys/module/x8h7_drv/parameters/{min_gap_us,spi_hz}.
  * Tune while watching the H7 heartbeat spierr counter (x8h7_can hb_log_every): a gap too short for the H7 to re-arm
  * its SPI DMA shows up there as overruns. spi_hz 0 = device-tree spi-max-frequency. */
-static unsigned int min_gap_us = X8H7_SPI_MIN_GAP_US;
+/* Default 0 since H7 fw b5fcbf4 (swap-at-completion: the H7 arms its SPI DMA from the transfer-complete ISR, so
+ * there is no re-arm window to protect): 2026-10-22 sweep 0/50/100/200 us -> H7 spierr 0 at every setting, stale
+ * replies 2-3 % at 0-100 us vs 10 % at 200 us. Set X8H7_SPI_MIN_GAP_US (200) for firmware without that change. */
+static unsigned int min_gap_us = 0;
 module_param(min_gap_us, uint, 0644);
 MODULE_PARM_DESC(min_gap_us, "minimum gap between consecutive SPI exchanges in us (0 = none)");
 static unsigned int spi_hz = 0;
