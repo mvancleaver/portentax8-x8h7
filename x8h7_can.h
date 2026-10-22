@@ -76,8 +76,8 @@
  * BATCH_DEADLINE_NS bounds TX latency for partial batches at low rate.
  * 500 us = 10% of 5 ms (200 Hz wheel period); acceptable per control budget.
  */
-#define X8H7_CAN_BATCH_MAX         8
-#define X8H7_CAN_BATCH_DEADLINE_NS 500000  /* 500 us */
+#define X8H7_CAN_BATCH_MAX         6       /* 2026-10-22: = fleet size, so a full write pass flushes at once (was 8) */
+#define X8H7_CAN_BATCH_DEADLINE_NS 100000  /* 100 us (was 500: the batch wait was most of the reply-after-next-read latency) */
 
 /* Phase 07.4.42.2 P0-4 — TX ring (head/tail/inflight, free-running u32
  * counters masked into the ring). RING_SIZE is also the echo-skb count
