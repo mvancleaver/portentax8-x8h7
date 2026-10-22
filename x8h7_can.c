@@ -3,6 +3,7 @@
  */
 
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/sched.h>
 #include "x8h7_can.h"
 
@@ -1022,7 +1023,22 @@ static void x8h7_can_tx_work_handler(struct kthread_work *ws)
   more = (gen == priv->tx_gen) && (priv->tx_tail != priv->tx_head);
   spin_unlock_bh(&priv->ring_lock);
 
-  x8h7_pkt_send_now();   /* flushes our frames and anything else queued, frees txb for the remainder */
+  {
+    /* 2026-10-22 bench: the 600 s run dies on a transient (>= 300 ms) silence of the whole link. Time the
+     * exchange (includes waiting for the spidev mutex held by the IRQ thread's exchange): a long value here
+     * means the SPI transfer or its lock hung, a short value with no replies means the H7 did not transmit. */
+    ktime_t const t0 = ktime_get();
+    x8h7_pkt_send_now();   /* flushes our frames and anything else queued, frees txb for the remainder */
+    s64 const us = ktime_us_delta(ktime_get(), t0);
+    if (us > priv->tx_xchg_max_us) priv->tx_xchg_max_us = us;
+    if (us > 2000) {
+      priv->tx_xchg_slow++;
+      if (net_ratelimit())
+        netdev_warn(priv->net, "SPI exchange (pkt_send_now) took %lld us (slow #%u, max %lld us, inflight %u)\n",
+                    (long long)us, priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us,
+                    priv->tx_head - priv->tx_inflight);
+    }
+  }
 
 #if DEBUG_X8H7_TX_TRACE
   pr_info("[x8h7_can_TRACE-6] tx_work_handler: flushed sent=%u/%u more=%d\n", sent, n, more);
