@@ -35,6 +35,11 @@
 #include <linux/compat.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/ktime.h>
+#include <linux/delay.h>
+#ifndef X8H7_SPI_MIN_GAP_US
+#define X8H7_SPI_MIN_GAP_US 200   /* us between consecutive SPI exchanges (H7 DMA re-arm window) */
+#endif
 #include <linux/interrupt.h>
 
 #include <linux/spi/spi.h>
@@ -345,7 +350,21 @@ int x8h7_spi_trx(struct spi_device *spi,
   spi_message_init(&m);
   spi_message_add_tail(&t, &m);
 
-  ret = spi_sync(spi, &m);
+  /* 2026-10-22 (07.4.42.2 bench): the H7 is an SPI slave whose DMA is re-armed from its
+   * transfer-complete interrupt, which its main loop masks (PRIMASK) while it processes the
+   * previous packet (~100 us with a 6-frame batch). An exchange started inside that window
+   * overruns the slave (HAL_SPI_ErrorCallback; the H7 heartbeat showed hundreds per second once
+   * the RT TX kthread + 100 us batching started exchanges back-to-back) and the data of that
+   * exchange is lost in both directions -> TX_COMPLETE never arrives -> "TX stalled" watchdog,
+   * replies lost -> stale faults. Enforce a minimum gap after the previous exchange ended. */
+  {
+    static ktime_t last_end;
+    s64 const since = ktime_us_delta(ktime_get(), last_end);
+    if (last_end && since >= 0 && since < X8H7_SPI_MIN_GAP_US)
+      usleep_range(X8H7_SPI_MIN_GAP_US - since, X8H7_SPI_MIN_GAP_US - since + 20);
+    ret = spi_sync(spi, &m);
+    last_end = ktime_get();
+  }
   if (ret) {
     DBG_ERROR("spi transfer failed: ret = %d\n", ret);
   }
