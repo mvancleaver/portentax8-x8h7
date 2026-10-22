@@ -1028,8 +1028,9 @@ static void x8h7_can_tx_work_handler(struct kthread_work *ws)
      * exchange (includes waiting for the spidev mutex held by the IRQ thread's exchange): a long value here
      * means the SPI transfer or its lock hung, a short value with no replies means the H7 did not transmit. */
     ktime_t const t0 = ktime_get();
+    s64 us;
     x8h7_pkt_send_now();   /* flushes our frames and anything else queued, frees txb for the remainder */
-    s64 const us = ktime_us_delta(ktime_get(), t0);
+    us = ktime_us_delta(ktime_get(), t0);
     if (us > priv->tx_xchg_max_us) priv->tx_xchg_max_us = us;
     if (us > 2000) {
       priv->tx_xchg_slow++;
