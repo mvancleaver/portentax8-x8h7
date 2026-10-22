@@ -306,6 +306,13 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
   u8                 intf  = pkt->data[0];
   u8                 eflag = pkt->data[1];
 
+  if (intf == 0x20 && pkt->size >= 8) {
+    /* 2026-10-22 diag: H7 heartbeat {0x20, seq, loop8, txsub8, txrep8, rxfr8, repulse8, spierr8} every 100 ms */
+    memcpy(priv->hb_last, pkt->data, 8);
+    priv->hb_jiffies = jiffies;
+    priv->hb_count++;
+    return;
+  }
   if (intf & X8H7_CAN_STS_INT_ERR) {
     if (pkt->size >= 4) {
       x8h7_can_error_state(priv, eflag, pkt->data[2], pkt->data[3]);
@@ -1154,7 +1161,11 @@ static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
   x8h7_can_tx_ring_reset(priv, priv->can.state != CAN_STATE_BUS_OFF);
   net->stats.tx_errors++;
   if (net_ratelimit())
-    netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s\n", "07.4.42.2 P0-4");
+    netdev_warn(net, "TX stalled (lost H7 status?) -- ring reset, %s; H7 heartbeat #%u age %u ms "
+                "{seq %u loop %u txsub %u txrep %u rxfr %u repulse %u spierr %u}; slow xchg %u max %lld us\n",
+                "07.4.42.2 P0-4", priv->hb_count, jiffies_to_msecs(jiffies - priv->hb_jiffies),
+                priv->hb_last[1], priv->hb_last[2], priv->hb_last[3], priv->hb_last[4], priv->hb_last[5],
+                priv->hb_last[6], priv->hb_last[7], priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us);
 }
 
 /**

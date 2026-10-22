@@ -182,6 +182,9 @@ struct x8h7_can_priv {
    * not a per-CPU CFS workqueue: a SCHED_FIFO userspace writer on the same CPU starved the
    * kworker and the drain fell from 3000 to ~940 requests/s (raw sender at FIFO 90: 9000 -> ~500). */
   s64                          tx_xchg_max_us;        /* 2026-10-22 diag: longest pkt_send_now() in the TX kthread */
+  u8                           hb_last[8];            /* 2026-10-22 diag: last H7 heartbeat status */
+  unsigned long                hb_jiffies;
+  u32                          hb_count;
   u32                          tx_xchg_slow;          /* count of exchanges > 2 ms */
   struct kthread_worker       *wq;
   struct kthread_work          work;
