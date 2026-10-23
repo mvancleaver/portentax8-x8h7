@@ -65,6 +65,12 @@ static struct dentry *x8h7_can_diag_dir  = NULL;
 static unsigned int hb_log_every = 0;
 module_param(hb_log_every, uint, 0644);
 MODULE_PARM_DESC(hb_log_every, "log H7 heartbeat counters every N heartbeats (0 = off)");
+
+/* 07.4.42.4 D-02: ndo_tx_timeout re-initialises FDCAN2 (queues restart_work) when the last H7 heartbeat is older than
+ * this many ms, or when the H7 is alive but reports can2_initialised 0. 0 = both tx_timeout triggers off. */
+static unsigned int h7_silence_reinit_ms = X8H7_CAN_H7_SILENCE_REINIT_MS;
+module_param(h7_silence_reinit_ms, uint, 0644);
+MODULE_PARM_DESC(h7_silence_reinit_ms, "ndo_tx_timeout re-inits FDCAN2 when the H7 heartbeat is older than this (ms; 0 = off)");
 #ifdef DEBUG
   #define DBG_CAN_STATE(d, s) { \
     DBG_PRINT("device %s:CAN State: %d CAN controller %s\n", d, s, can_sts(s)); \
@@ -289,6 +295,23 @@ static void x8h7_can_error_state(struct x8h7_can_priv *priv, u8 flags, u8 tec, u
   }
 }
 
+/* 07.4.42.4 D-02: self-heal = queue the bus-off restart handler (hw_stop + hw_setup + ring reset + ERROR_ACTIVE +
+ * wake) on the existing TX kthread. Never goes through ndo_stop/ndo_open, so x8h7cantx-<if> (pinned to CPU0 by
+ * x8-rt-promote.sh --cpu 0) survives. Callable from the x8h7 IRQ-thread hook (spidev->lock held: no SPI here) and
+ * from ndo_tx_timeout (timer softirq). Bit 0 of h7_reinit_pending is cleared by x8h7_can_restart_work_fn(). */
+static bool x8h7_can_queue_h7_reinit(struct x8h7_can_priv *priv)
+{
+  if (!priv->wq || !netif_running(priv->net))
+    return false;
+  if (test_and_set_bit(0, &priv->h7_reinit_pending))
+    return false;
+  priv->h7_reinits++;
+  netif_trans_update(priv->net);   /* the stopped queue is not a TX stall */
+  netif_stop_queue(priv->net);     /* no frame races the DEINIT/INIT pair (same as x8h7_can_restart) */
+  kthread_queue_work(priv->wq, &priv->restart_work);
+  return true;
+}
+
 /* Phase 07.4.42.2 — CAN_STATUS (opcode 0x40, H7 -> kernel) per the shared
  * WIRE CONTRACT (07.4.42.2-04-PLAN <interfaces>; the same table is in the H7
  * Plans 05/06). Accepts both the new H7 firmware and the legacy one (md5
@@ -320,6 +343,7 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
                        get_unaligned_le16(pkt->data + 6), get_unaligned_le16(pkt->data + 8),
                        get_unaligned_le16(pkt->data + 10) };
     unsigned int const age = priv->hb_count ? jiffies_to_msecs(jiffies - priv->hb_jiffies) : 0;
+    bool boot_changed = false;
     if (priv->hb_count && age > 150 && net_ratelimit())
       netdev_warn(net, "H7 heartbeat gap %u ms (seq %u->%u): d_loop %u d_spierr %u d_rxfr %u d_txsub %u d_repulse %u\n",
                   age, priv->hb_last[1], pkt->data[1],
@@ -331,10 +355,13 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
                   (u16)(f[0] - priv->hb_v2[0]), (u16)(f[1] - priv->hb_v2[1]), (u16)(f[2] - priv->hb_v2[2]),
                   (u16)(f[3] - priv->hb_v2[3]), (u16)(f[4] - priv->hb_v2[4]), f[1], f[4]);
     memcpy(priv->hb_last, pkt->data, 8);
+    if (priv->hb_count)
+      priv->hb_loop_delta = (u16)(f[0] - priv->hb_v2[0]);
     memcpy(priv->hb_v2, f, sizeof(f));
     if (pkt->size >= 38) {
       /* v3 boot report: {reset_cause16, fault_kind8, stage8, pc32, lr32, cfsr32, hfsr32, addr32, boot_count16} */
       u16 const bc = get_unaligned_le16(pkt->data + 36);
+      boot_changed = priv->hb_count && bc != priv->hb_boot_count;   /* evaluated BEFORE hb_boot_count is overwritten */
       if (bc != priv->hb_boot_count || !priv->hb_count) {
         u16 const rc = get_unaligned_le16(pkt->data + 12);
         priv->hb_boot_count  = bc;
@@ -354,6 +381,44 @@ static void x8h7_can_status(struct x8h7_can_priv *priv, x8h7_pkt_t *pkt)
                     (rc & BIT(21 - 16)) ? " BOR" : "",
                     priv->hb_fault_kind, priv->hb_pc, priv->hb_lr, priv->hb_cfsr, priv->hb_hfsr, priv->hb_addr, priv->hb_stage);
       }
+    }
+    /* 07.4.42.4 D-01/D-02: heartbeat v4 (39 B) byte 38 = flags, bit0 = FDCAN2 initialised. Read only when size >= 39. */
+    if (pkt->size >= 39) {
+      priv->hb_flags      = pkt->data[38];
+      priv->hb_has_flags  = true;
+      priv->hb_flag0_streak = (priv->hb_flags & X8H7_HB_FLAG_CAN2_INIT) ? 0 : min_t(u8, priv->hb_flag0_streak + 1, 255);
+    } else {
+      priv->hb_has_flags    = false;
+      priv->hb_flag0_streak = 0;
+    }
+    /* ndo_open just sent CAN_INIT: the first heartbeat after open only re-baselines the boot counter. */
+    if (priv->hb_resync) {
+      priv->hb_resync = false;
+      boot_changed    = false;
+    }
+    /* A new H7 boot gets a fresh retry budget. */
+    if (boot_changed) {
+      WRITE_ONCE(priv->h7_reinit_fail_streak, 0);
+      WRITE_ONCE(priv->h7_reinit_retry_at, jiffies);
+    }
+    /* 07.4.42.4 D-02 self-heal trigger: the H7 rebooted (boot counter changed after the first heartbeat) or two
+     * consecutive v4 heartbeats report can2_initialised 0 while the netdev is up (the 2-heartbeat / 200 ms debounce
+     * exists because a heartbeat queued in the H7 before ndo_open's CAN_INIT still carries 0). At most one
+     * heartbeat-triggered re-init per boot counter value; re-armed (hb_reinit_boot reset) only by a failed re-init in
+     * x8h7_can_restart_work_fn(), then at most X8H7_H7_REINIT_MAX_RETRIES times, >= X8H7_H7_REINIT_RETRY_MS apart.
+     * Only queues kthread work; never SPI from here (spidev->lock is held).
+     * Known consequence: a real H7 reboot silences the motors 0.5-1 s, so the 100 ms stale fault policy still e-stops an
+     * active robot; self-heal only makes the link usable again without operator action.
+     * Not covered: H7-side std_flt/ext_flt filters are not re-applied (production sets none); can0/FDCAN1 (the
+     * heartbeat rides the FDCAN2 status channel). */
+    if ((boot_changed || (priv->hb_has_flags && priv->hb_flag0_streak >= 2)) && netif_running(net) &&
+        (u32)priv->hb_boot_count != READ_ONCE(priv->hb_reinit_boot) &&
+        READ_ONCE(priv->h7_reinit_fail_streak) < X8H7_H7_REINIT_MAX_RETRIES &&
+        time_after_eq(jiffies, READ_ONCE(priv->h7_reinit_retry_at))) {
+      WRITE_ONCE(priv->hb_reinit_boot, priv->hb_boot_count);
+      if (x8h7_can_queue_h7_reinit(priv))
+        netdev_warn(net, "H7 rebooted (boot #%u, cause 0x%04x) -- re-initialising FDCAN2\n",
+                    priv->hb_boot_count, priv->hb_reset_cause);
     }
     priv->hb_jiffies = jiffies;
     priv->hb_count++;
@@ -608,7 +673,9 @@ static void x8h7_can_diag_exit(void) {
  * re-init itself still runs on priv->wq (Patch 0090 structure).
  */
 
-/* Phase 7.4.42.1 Patch 0090 (T3) / 07.4.42.2 P1-4 — restart_work handler.
+/* Phase 7.4.42.1 Patch 0090 (T3) / 07.4.42.2 P1-4 / 07.4.42.4 D-02 — restart_work handler (bus-off restart AND H7
+ * self-heal: x8h7_can_queue_h7_reinit() queues this same work). A failed hw_setup re-arms the heartbeat trigger for the
+ * same boot value, at most X8H7_H7_REINIT_MAX_RETRIES consecutive times, >= X8H7_H7_REINIT_RETRY_MS apart.
  * Runs in priv->wq workqueue context (WQ_HIGHPRI). x8h7_can_hw_stop/_setup
  * call x8h7_pkt_send_sync(), which takes the spidev mutex and may sleep —
  * safe here. The TX queue was stopped by x8h7_can_restart() and is woken only
@@ -619,13 +686,25 @@ static void x8h7_can_restart_work_fn(struct kthread_work *ws)
   struct net_device    *net  = priv->net;
   int                   ret;
 
-  DBG_PRINT("bus-off restart: re-init FDCAN via x8h7_can_hw_stop + x8h7_can_hw_setup\n");
+  DBG_PRINT("bus-off restart / H7 self-heal: re-init FDCAN via x8h7_can_hw_stop + x8h7_can_hw_setup\n");
   x8h7_can_hw_stop(priv);
   ret = x8h7_can_hw_setup(priv);
   if (ret) {
-    netdev_err(net, "bus-off restart: H7 re-init failed (%d); TX queue left stopped\n", ret);
+    netdev_err(net, "H7 re-init (bus-off restart / self-heal) failed (%d); TX queue left stopped\n", ret);
+    priv->h7_reinit_failures++;
+    if (READ_ONCE(priv->h7_reinit_fail_streak) + 1 < X8H7_H7_REINIT_MAX_RETRIES) {
+      WRITE_ONCE(priv->h7_reinit_fail_streak, priv->h7_reinit_fail_streak + 1);
+      WRITE_ONCE(priv->h7_reinit_retry_at, jiffies + msecs_to_jiffies(X8H7_H7_REINIT_RETRY_MS));
+      WRITE_ONCE(priv->hb_reinit_boot, X8H7_HB_NO_BOOT);   /* re-arm the heartbeat trigger for the same boot value */
+    } else {
+      WRITE_ONCE(priv->h7_reinit_fail_streak, X8H7_H7_REINIT_MAX_RETRIES);
+      netdev_err(net, "H7 re-init failed %u times -- giving up until ip link down/up or the next H7 boot\n",
+                 (unsigned int)X8H7_H7_REINIT_MAX_RETRIES);
+    }
+    clear_bit(0, &priv->h7_reinit_pending);
     return;
   }
+  WRITE_ONCE(priv->h7_reinit_fail_streak, 0);
 
   /* No CAN_ERR_RESTARTED skb here: drivers/net/can/dev/dev.c can_restart()
    * already emitted it before calling do_set_mode(CAN_MODE_START). Patch 0090's
@@ -649,6 +728,7 @@ static void x8h7_can_restart_work_fn(struct kthread_work *ws)
   WRITE_ONCE(priv->can.state, CAN_STATE_ERROR_ACTIVE);
   spin_unlock_bh(&priv->ring_lock);
   netif_wake_queue(net);
+  clear_bit(0, &priv->h7_reinit_pending);
 }
 
 static int x8h7_can_restart(struct net_device *net)
@@ -835,8 +915,6 @@ static int x8h7_can_open(struct net_device *net)
   kthread_init_work(&priv->work, x8h7_can_tx_work_handler);
   kthread_init_work(&priv->restart_work, x8h7_can_restart_work_fn);
 
-  mutex_init(&priv->lock);
-
   ret = x8h7_can_hw_stop(priv);
   if (ret) {
     goto out_free_wq;
@@ -845,6 +923,14 @@ static int x8h7_can_open(struct net_device *net)
   if (ret) {
     goto out_free_wq;
   }
+  /* 07.4.42.4 D-02: in place BEFORE set_normal_mode registers the IRQ-thread hook, otherwise the first heartbeat after
+   * open could see hb_resync false and cause one redundant re-init. ip link down/up resets the retry budget. */
+  priv->hb_resync = true;
+  priv->hb_flag0_streak = 0;
+  priv->h7_reinit_fail_streak = 0;
+  priv->h7_reinit_retry_at = jiffies;
+  priv->hb_reinit_boot = X8H7_HB_NO_BOOT;
+  clear_bit(0, &priv->h7_reinit_pending);
   ret = x8h7_can_set_normal_mode(priv);
   if (ret) {
     goto out_free_wq;
@@ -855,10 +941,13 @@ static int x8h7_can_open(struct net_device *net)
   return 0;
 
 out_free_wq:
+  x8h7_hook_set(priv->periph, NULL, NULL);   /* no IRQ-thread trigger can queue work on the dying worker */
+  mutex_lock(&priv->lock);                   /* the h7 sysfs attr reads priv->wq under this lock */
   kthread_destroy_worker(priv->wq);
   priv->wq = NULL;   /* 07.4.42.2 REVIEW IN-03: x8h7_can_restart() and the batch timer test priv->wq */
+  mutex_unlock(&priv->lock);
 out_clean:
-  x8h7_hook_set(priv->periph, NULL, NULL);
+  x8h7_hook_set(priv->periph, NULL, NULL);   /* idempotent */
   close_candev(net);
   return ret;
 }
@@ -1204,6 +1293,7 @@ static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
 {
   struct x8h7_can_priv *priv = netdev_priv(net);
 
+  priv->tx_stalls++;
   x8h7_can_tx_ring_reset(priv, priv->can.state != CAN_STATE_BUS_OFF);
   net->stats.tx_errors++;
   if (net_ratelimit())
@@ -1212,6 +1302,22 @@ static void x8h7_can_tx_timeout(struct net_device *net, unsigned int txqueue)
                 "07.4.42.2 P0-4", priv->hb_boot_count, priv->hb_count, jiffies_to_msecs(jiffies - priv->hb_jiffies),
                 priv->hb_last[1], priv->hb_v2[0], priv->hb_v2[1], priv->hb_v2[2], priv->hb_v2[3], priv->hb_v2[4],
                 priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us);
+
+  /* 07.4.42.4 D-02 belt and braces, independent of the heartbeat-driven trigger: re-init FDCAN2 when the H7 is silent
+   * (last heartbeat older than h7_silence_reinit_ms) or alive but reporting can2_initialised 0 (e.g. a failed
+   * re-init). h7_silence_reinit_ms == 0 disables both tx_timeout-driven triggers (runtime kill switch). */
+  if (h7_silence_reinit_ms && priv->hb_count &&
+      READ_ONCE(priv->h7_reinit_fail_streak) < X8H7_H7_REINIT_MAX_RETRIES &&
+      time_after_eq(jiffies, READ_ONCE(priv->h7_reinit_retry_at))) {
+    unsigned int const age = jiffies_to_msecs(jiffies - priv->hb_jiffies);
+    if (age > h7_silence_reinit_ms) {
+      if (x8h7_can_queue_h7_reinit(priv))
+        netdev_warn(net, "H7 silent for %u ms (no heartbeat) -- re-initialising FDCAN2\n", age);
+    } else if (priv->hb_has_flags && !(priv->hb_flags & X8H7_HB_FLAG_CAN2_INIT)) {
+      if (x8h7_can_queue_h7_reinit(priv))
+        netdev_warn(net, "H7 alive but FDCAN2 not initialised -- re-initialising FDCAN2\n");
+    }
+  }
 }
 
 /**
@@ -1399,14 +1505,42 @@ static ssize_t x8h7_can_sts_show(struct device *dev,
   return len;
 }
 
+/* 07.4.42.4 D-04: read-only H7 / self-heal / RT-placement visibility (one "key value" per line; the 14 D-04 keys,
+ * then h7_reinit_failures). Read by the x8 health monitor from the container via /sys/class/net/can1/x8h7can/h7. */
+static ssize_t x8h7_can_h7_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+  struct x8h7_can_priv *priv = netdev_priv(to_net_dev(dev));
+  int                   cpu = -1;
+  char                  allowed[64] = "none";
+
+  mutex_lock(&priv->lock);   /* x8h7_can_stop() destroys the worker under priv->lock */
+  if (priv->wq && priv->wq->task) {
+    cpu = task_cpu(priv->wq->task);
+    scnprintf(allowed, sizeof(allowed), "%*pbl", cpumask_pr_args(priv->wq->task->cpus_ptr));
+  }
+  mutex_unlock(&priv->lock);
+  return sysfs_emit(buf,
+                    "boot_count %u\nreset_cause 0x%04x\ncan2_initialised %d\nhb_count %u\nhb_age_ms %ld\n"
+                    "spierr %u\nrepulse %u\nloop_per_100ms %u\ntx_stalls %u\nh7_reinits %u\nslow_xchg %u\n"
+                    "max_xchg_us %lld\ntx_kthread_cpu %d\ntx_kthread_cpus_allowed %s\nh7_reinit_failures %u\n",
+                    (unsigned int)priv->hb_boot_count, (unsigned int)priv->hb_reset_cause,
+                    priv->hb_has_flags ? ((priv->hb_flags & X8H7_HB_FLAG_CAN2_INIT) ? 1 : 0) : -1,
+                    priv->hb_count, priv->hb_count ? (long)jiffies_to_msecs(jiffies - priv->hb_jiffies) : -1L,
+                    (unsigned int)priv->hb_v2[1], (unsigned int)priv->hb_v2[4], (unsigned int)priv->hb_loop_delta,
+                    priv->tx_stalls, priv->h7_reinits, priv->tx_xchg_slow, (long long)priv->tx_xchg_max_us,
+                    cpu, allowed, priv->h7_reinit_failures);
+}
+
 static DEVICE_ATTR(std_flt, 0644, x8h7_can_sf_show, x8h7_can_sf_store);
 static DEVICE_ATTR(ext_flt, 0644, x8h7_can_ef_show, x8h7_can_ef_store);
 static DEVICE_ATTR(status , 0644, x8h7_can_sts_show, NULL);
+static DEVICE_ATTR(h7, 0444, x8h7_can_h7_show, NULL);
 
 static struct attribute *x8h7_can_sysfs_attrs[] = {
   &dev_attr_std_flt.attr,
   &dev_attr_ext_flt.attr,
   &dev_attr_status.attr,
+  &dev_attr_h7.attr,
   //....
   NULL,
 };
@@ -1449,6 +1583,10 @@ static int x8h7_can_probe(struct platform_device *pdev)
   net->sysfs_groups[0] = &x8h7_can_sysfs_attr_group;
 
   priv = netdev_priv(net);
+
+  /* 07.4.42.4: the h7 sysfs attr takes priv->lock before any ndo_open, so the mutex must exist from probe. */
+  mutex_init(&priv->lock);
+  priv->hb_reinit_boot = X8H7_HB_NO_BOOT;
 
   priv->can.clock.freq             = clock_freq;
   priv->can.bittiming_const        = &x8h7_can_bittiming_const;

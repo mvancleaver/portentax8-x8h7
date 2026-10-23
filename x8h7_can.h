@@ -37,6 +37,16 @@
 #define X8H7_CAN_STS_INT_TX_ABORT_COMPLETE 0x08
 #define X8H7_CAN_STS_INT_TX_FIFO_EMPTY     0x10
 
+/* 07.4.42.4 D-02/D-04: H7 self-heal. Heartbeat v4 (39 B) byte 38 = flags, bit0 = FDCAN2 initialised. */
+#define X8H7_HB_FLAG_CAN2_INIT         0x01
+/* 07.4.42.4 D-02: "no heartbeat-triggered re-init done yet for any boot counter value" sentinel (hb_boot_count is u16). */
+#define X8H7_HB_NO_BOOT                0xFFFFFFFFu
+/* 07.4.42.4 D-02: ndo_tx_timeout re-inits FDCAN2 when the H7 heartbeat is older than this (module param h7_silence_reinit_ms). */
+#define X8H7_CAN_H7_SILENCE_REINIT_MS  1000
+/* 07.4.42.4 D-02: bounded retry after a failed self-heal re-init (hw_setup failed in restart_work). */
+#define X8H7_H7_REINIT_MAX_RETRIES     5
+#define X8H7_H7_REINIT_RETRY_MS        500
+
 #define X8H7_CAN_STS_FLG_RX_OVR  0x01  // Receive Buffer Overflow
 #define X8H7_CAN_STS_FLG_TX_BO   0x02  // Bus-Off
 #define X8H7_CAN_STS_FLG_TX_EP   0x04  // Transmit Error-Passive
@@ -191,6 +201,20 @@ struct x8h7_can_priv {
   u8                           hb_fault_kind, hb_stage;
   u32                          hb_pc, hb_lr, hb_cfsr, hb_hfsr, hb_addr;
   u32                          tx_xchg_slow;          /* count of exchanges > 2 ms */
+  /* 07.4.42.4 D-02/D-04: H7 self-heal + runtime visibility; written by the IRQ-thread hook / tx_timeout /
+   * restart_work, read lock-free by the h7 sysfs attr; cross-context fields use READ_ONCE/WRITE_ONCE. */
+  u8                           hb_flags;              /* heartbeat v4 byte 38 */
+  bool                         hb_has_flags;          /* last heartbeat carried the flags byte (size >= 39) */
+  u8                           hb_flag0_streak;       /* consecutive v4 heartbeats with can2_initialised == 0 */
+  bool                         hb_resync;             /* first heartbeat after ndo_open only re-baselines the boot counter */
+  u32                          hb_reinit_boot;        /* boot counter value a heartbeat-triggered re-init was queued for */
+  u16                          hb_loop_delta;         /* H7 loop counter delta between the last two heartbeats */
+  unsigned long                h7_reinit_pending;     /* bit 0: restart_work queued by the self-heal / bus-off path */
+  u32                          h7_reinits;            /* self-heal re-inits queued since module load */
+  u32                          tx_stalls;             /* ndo_tx_timeout calls since module load */
+  u8                           h7_reinit_fail_streak; /* consecutive restart_work runs whose hw_setup failed */
+  u32                          h7_reinit_failures;    /* restart_work runs whose hw_setup failed, since module load */
+  unsigned long                h7_reinit_retry_at;    /* jiffies: earliest next self-heal attempt */
   struct kthread_worker       *wq;
   struct kthread_work          work;
 
